@@ -5,9 +5,11 @@ services:
       - --providers.docker=true
       - --providers.docker.exposedbydefault=false
       - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
       # Add websecure for TLS later if domain available
     ports:
       - "80:80"
+      - "443:443"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     labels:
@@ -35,11 +37,17 @@ services:
       # Public routes
       - traefik.http.routers.webapp-public.rule=PathPrefix(`/`) || PathPrefix(`/register`) || PathPrefix(`/invite`)
       - traefik.http.routers.webapp-public.entrypoints=web
+      - traefik.http.routers.webapp-public-secure.rule=PathPrefix(`/`) || PathPrefix(`/register`) || PathPrefix(`/invite`)
+      - traefik.http.routers.webapp-public-secure.entrypoints=websecure
+      - traefik.http.routers.webapp-public-secure.tls=true
       - traefik.http.services.webapp.loadbalancer.server.port=80
       # VPN-only routes (host header + ipWhitelist)
       - traefik.http.middlewares.vpnonly-ipwhitelist.ipwhitelist.sourcerange={{WG_SUBNET}}
       - traefik.http.routers.webapp-vpn.rule=Host(`portal.safe.lan`)
       - traefik.http.routers.webapp-vpn.entrypoints=web
+      - traefik.http.routers.webapp-vpn-secure.rule=Host(`portal.safe.lan`)
+      - traefik.http.routers.webapp-vpn-secure.entrypoints=websecure
+      - traefik.http.routers.webapp-vpn-secure.tls=true
       - traefik.http.routers.webapp-vpn.middlewares=vpnonly-ipwhitelist
 
   core-api:
@@ -58,10 +66,16 @@ services:
       # Public API subset
       - traefik.http.routers.coreapi-public.rule=PathPrefix(`/api/core/registration`) || PathPrefix(`/api/core/captcha`)
       - traefik.http.routers.coreapi-public.entrypoints=web
+      - traefik.http.routers.coreapi-public-secure.rule=PathPrefix(`/api/core/registration`) || PathPrefix(`/api/core/captcha`)
+      - traefik.http.routers.coreapi-public-secure.entrypoints=websecure
+      - traefik.http.routers.coreapi-public-secure.tls=true
       - traefik.http.services.coreapi.loadbalancer.server.port=8080
       # VPN-only
       - traefik.http.routers.coreapi-vpn.rule=Host(`portal.safe.lan`)
       - traefik.http.routers.coreapi-vpn.entrypoints=web
+      - traefik.http.routers.coreapi-vpn-secure.rule=Host(`portal.safe.lan`)
+      - traefik.http.routers.coreapi-vpn-secure.entrypoints=websecure
+      - traefik.http.routers.coreapi-vpn-secure.tls=true
       - traefik.http.routers.coreapi-vpn.middlewares=vpnonly-ipwhitelist
 
   wg-provisioner:

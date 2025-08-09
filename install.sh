@@ -87,6 +87,7 @@ DNSMASQ_CONF_DST="$DNSMASQ_DIR/dnsmasq.conf"
 # --- Opcje sterujące ---
 # Ustaw FORCE_AUTHELIA_MINIMAL=1 aby nadpisać istniejący configuration.yml minimalną konfiguracją
 FORCE_AUTHELIA_MINIMAL=${FORCE_AUTHELIA_MINIMAL:-0}
+OIDC_ENABLE=${OIDC_ENABLE:-0}
 
 # --- Instalacja zależności systemowych ---
 info "Instaluję zależności systemowe (curl, gnupg, lsb-release, apt-transport-https, ca-certificates)"
@@ -168,6 +169,31 @@ EOF
 # Włącz i startuj WG
 systemctl enable wg-quick@wg0 || true
 systemctl restart wg-quick@wg0 || systemctl start wg-quick@wg0
+
+# --- Konfiguracja resolvera systemowego na 10.66.0.1 (opcjonalnie) ---
+configure_resolver() {
+  local WG_DNS="10.66.0.1"
+  if command -v resolvectl >/dev/null 2>&1 && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    info "Wykryto systemd-resolved – ustawiam DNS na ${WG_DNS} (fallback 1.1.1.1)"
+    resolvectl dns wg0 ${WG_DNS} 1.1.1.1 || true
+    resolvectl domain wg0 "${PRIVATE_SUFFIX}" || true
+    resolvectl flush-caches || true
+  else
+    warn "systemd-resolved nieaktywny – aktualizuję /etc/resolv.conf (zachowuję kopię)"
+    if [[ -f /etc/resolv.conf ]]; then cp -n /etc/resolv.conf /etc/resolv.conf.bak.$(date +%s) || true; fi
+    cat > /etc/resolv.conf <<RCF
+nameserver ${WG_DNS}
+nameserver 1.1.1.1
+search ${PRIVATE_SUFFIX}
+RCF
+  fi
+}
+
+# zapytaj użytkownika, czy ustawić resolver teraz
+read -r -p "Ustawić systemowy resolver DNS na 10.66.0.1? (y/N): " SET_RESOLVER || true
+if [[ ${SET_RESOLVER:-N} =~ ^[Yy]$ ]]; then
+  configure_resolver || true
+fi
 
 # --- NAT / full-tunnel (opcjonalnie) ---
 if [[ -z "$FULL_TUNNEL" ]]; then
@@ -256,10 +282,29 @@ fi
 if [[ "$NEED_MINIMAL_CFG" == "1" ]]; then
   SESS_SECRET=$(openssl rand -base64 48)
   STOR_KEY=$(openssl rand -base64 48)
+  OIDC_RSA=""
+  OIDC_RSA_ESCAPED=""
+  OIDC_WEB_REDIRECT=""
+  OIDC_API_REDIRECT=""
+  OIDC_API_SECRET=""
+  if [[ "$OIDC_ENABLE" == "1" ]]; then
+    info "Włączono OIDC: generuję klucz RSA i konfigurację klientów"
+    OIDC_RSA=$(openssl genrsa 4096)
+    # przygotuj redirecty na podstawie domeny lub portalu VPN
+    if [[ -n "$DOMAIN" ]]; then
+      OIDC_WEB_REDIRECT="https://${DOMAIN}/oidc/callback"
+      OIDC_API_REDIRECT="https://${DOMAIN}/api/core/oidc/callback"
+    else
+      OIDC_WEB_REDIRECT="http://portal.${PRIVATE_SUFFIX}/oidc/callback"
+      OIDC_API_REDIRECT="http://portal.${PRIVATE_SUFFIX}/api/core/oidc/callback"
+    fi
+    OIDC_API_SECRET=$(openssl rand -hex 32)
+  fi
   # backup jeśli istniał
   if [[ -f "$AUTHELIA_DIR/configuration.yml" ]]; then
     cp -v "$AUTHELIA_DIR/configuration.yml" "$AUTHELIA_DIR/configuration.yml.bak.$(date +%s)" || true
   fi
+  if [[ "$OIDC_ENABLE" != "1" ]]; then
   cat > "$AUTHELIA_DIR/configuration.yml" <<'YAML'
 theme: light
 
@@ -296,6 +341,80 @@ session:
   expiration: '1h'
   inactivity: '5m'
 YAML
+  else
+  cat > "$AUTHELIA_DIR/configuration.yml" <<YAML
+theme: light
+
+log:
+  level: info
+
+server:
+  address: 'tcp://0.0.0.0:9091'
+
+authentication_backend:
+  file:
+    path: /config/users_database.yml
+
+storage:
+  encryption_key: REPLACE_STORAGE_KEY
+  local:
+    path: /config/db.sqlite3
+
+notifier:
+  filesystem:
+    filename: /config/notification.txt
+
+access_control:
+  default_policy: one_factor
+  rules:
+    - domain: ['portal.safe.lan']
+      policy: one_factor
+
+session:
+  name: 'authelia_session'
+  secret: REPLACE_SESSION_SECRET
+  domain: 'safe.lan'
+  same_site: 'lax'
+  expiration: '1h'
+  inactivity: '5m'
+
+identity_providers:
+  oidc:
+    # Authelia użyje tego klucza do podpisu tokenów
+    issuer_private_key: |
+$(echo "$OIDC_RSA" | sed 's/^/      /')
+    enforce_pkce: public_clients_only
+    clients:
+      - id: webapp
+        description: Web Frontend (SPA)
+        public: true
+        redirect_uris:
+          - ${OIDC_WEB_REDIRECT}
+        scopes:
+          - openid
+          - profile
+          - email
+        grant_types:
+          - authorization_code
+        response_types:
+          - code
+        token_endpoint_auth_method: none
+      - id: core-api
+        description: Core API (confidential)
+        secret: ${OIDC_API_SECRET}
+        redirect_uris:
+          - ${OIDC_API_REDIRECT}
+        scopes:
+          - openid
+          - profile
+          - email
+        grant_types:
+          - authorization_code
+        response_types:
+          - code
+        token_endpoint_auth_method: client_secret_post
+YAML
+  fi
   sed -i "s|REPLACE_STORAGE_KEY|${STOR_KEY//|/\|}|" "$AUTHELIA_DIR/configuration.yml"
   sed -i "s|REPLACE_SESSION_SECRET|${SESS_SECRET//|/\|}|" "$AUTHELIA_DIR/configuration.yml"
   success "Zapisano minimalny Authelia configuration.yml"
