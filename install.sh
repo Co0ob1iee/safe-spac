@@ -4,6 +4,33 @@ set -euo pipefail
 # Resolve script directory (so rsync works even when called via absolute path)
 SCRIPT_DIR="$(cd -- "$(dirname "$0")" >/dev/null 2>&1 && pwd -P)"
 
+# --- Color & UI helpers ---
+if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then
+  ncolors=$(tput colors || echo 0)
+else
+  ncolors=0
+fi
+
+if [[ ${NO_COLOR:-} != 1 ]] && [[ $ncolors -ge 8 ]]; then
+  C_RESET="\033[0m"; C_BOLD="\033[1m"
+  C_INFO="\033[36m"; C_WARN="\033[33m"; C_ERR="\033[31m"; C_OK="\033[32m"; C_DIM="\033[2m"
+else
+  C_RESET=""; C_BOLD=""; C_INFO=""; C_WARN=""; C_ERR=""; C_OK=""; C_DIM=""
+fi
+
+info()    { printf "%b[INFO]%b %s\n"   "$C_INFO" "$C_RESET" "$*"; }
+warn()    { printf "%b[WARN]%b %s\n"   "$C_WARN" "$C_RESET" "$*"; }
+error()   { printf "%b[ERR ]%b %s\n"   "$C_ERR" "$C_RESET" "$*"; }
+success() { printf "%b[ OK ]%b %s\n"   "$C_OK"  "$C_RESET" "$*"; }
+step()    { printf "%b==>%b %s\n"       "$C_BOLD" "$C_RESET" "$*"; }
+
+banner() {
+  printf "\n%b🛰️  Safe‑Spac Installer%b\n" "$C_BOLD" "$C_RESET"
+  printf "%b=====================%b\n\n" "$C_DIM" "$C_RESET"
+}
+
+banner
+
 # safe-spac installer (production-ready)
 # Usage (non-interactive):
 #   PUBLIC_IP=<IP> ./install.sh
@@ -42,7 +69,7 @@ DNSMASQ_CONF_SRC="$DNSMASQ_DIR/dnsmasq.conf.tmpl"
 DNSMASQ_CONF_DST="$DNSMASQ_DIR/dnsmasq.conf"
 
 # --- Instalacja zależności systemowych ---
-echo "[INFO] Instaluję zależności systemowe (curl, gnupg, lsb-release, apt-transport-https, ca-certificates)"
+info "Instaluję zależności systemowe (curl, gnupg, lsb-release, apt-transport-https, ca-certificates)"
 apt-get update -y
 apt-get install -y ca-certificates curl gnupg lsb-release rsync iptables iproute2 dnsutils gettext-base unzip iptables-persistent
 
@@ -101,7 +128,7 @@ fi
 
 ALLOWED_IPS="10.66.0.0/24"
 if [[ ${FULL_TUNNEL:-N} =~ ^[Yy]$ ]]; then
-  echo "[INFO] Włączam IP forwarding i NAT dla ${WG_SUBNET}"
+  success "Włączam IP forwarding i NAT dla ${WG_SUBNET}"
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
   sed -i 's/^#\?net.ipv4.ip_forward=.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf || true
   # wykrycie interfejsu WAN
@@ -150,7 +177,7 @@ sed "s/{{PRIVATE_SUFFIX}}/${PRIVATE_SUFFIX}/g" "$DNSMASQ_CONF_SRC" > "$DNSMASQ_C
 mkdir -p "$AUTHELIA_DIR"
 ADMIN_EMAIL="admin@example.com"
 if [[ ! -f "$AUTHELIA_DIR/users_database.yml" ]]; then
-  echo "[INFO] Generuję losowe hasło admina Authelii"
+  step "Generuję losowe hasło admina Authelii"
   ADMIN_PASS=$(openssl rand -base64 18)
   HASH=$(docker run --rm authelia/authelia:4.38 authelia crypto hash generate argon2 --password "$ADMIN_PASS" | tail -1 | sed 's/^.*: //')
   # configuration.yml (jeśli nie istnieje)
