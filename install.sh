@@ -34,8 +34,9 @@ FULL_TUNNEL=${FULL_TUNNEL:-}
 INSTALL_ROOT=${INSTALL_ROOT:-/opt/safe-spac}
 DATA_DIR="$INSTALL_ROOT/server/data"
 AUTHELIA_DIR="$INSTALL_ROOT/authelia"
-DNSMASQ_CONF_SRC="$INSTALL_ROOT/dnsmasq/dnsmasq.conf.tmpl"
-DNSMASQ_CONF_DST="$INSTALL_ROOT/dnsmasq/dnsmasq.conf"
+DNSMASQ_DIR="$INSTALL_ROOT/dnsmasq"
+DNSMASQ_CONF_SRC="$DNSMASQ_DIR/dnsmasq.conf.tmpl"
+DNSMASQ_CONF_DST="$DNSMASQ_DIR/dnsmasq.conf"
 
 # --- Instalacja zależności systemowych ---
 echo "[INFO] Instaluję zależności systemowe (curl, gnupg, lsb-release, apt-transport-https, ca-certificates)"
@@ -119,7 +120,27 @@ if [[ ${FULL_TUNNEL:-N} =~ ^[Yy]$ ]]; then
 fi
 
 # --- dnsmasq (render + kontener host-mode) ---
-install -d -m 0755 "$(dirname "$DNSMASQ_CONF_DST")"
+install -d -m 0755 "$DNSMASQ_DIR"
+# Fallback: jeśli szablon nie istnieje (np. problem z rsync), utwórz domyślny
+if [[ ! -f "$DNSMASQ_CONF_SRC" ]]; then
+  cat >"$DNSMASQ_CONF_SRC" <<'TMPL'
+# dnsmasq basic config for Safe‑Spac
+no-resolv
+domain-needed
+bogus-priv
+listen-address=127.0.0.1
+listen-address=10.66.0.1
+
+# Private suffix
+local=/{{PRIVATE_SUFFIX}}/
+domain={{PRIVATE_SUFFIX}}
+
+# Internal hosts
+address=/portal.{{PRIVATE_SUFFIX}}/10.66.0.1
+address=/service.teamspeak/10.66.0.1
+address=/service.git/10.66.0.1
+TMPL
+fi
 sed "s/{{PRIVATE_SUFFIX}}/${PRIVATE_SUFFIX}/g" "$DNSMASQ_CONF_SRC" > "$DNSMASQ_CONF_DST"
 
 # --- Authelia: generacja hasła admina ---
