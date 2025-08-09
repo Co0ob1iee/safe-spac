@@ -16,7 +16,8 @@ services:
       - traefik.enable=true
 
   dnsmasq:
-    image: ghcr.io/jpillora/dnsmasq:latest
+    image: andyshinn/dnsmasq:2.86
+    restart: unless-stopped
     network_mode: host
     volumes:
       - /opt/safe-spac/dnsmasq/dnsmasq.conf:/etc/dnsmasq.conf:ro
