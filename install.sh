@@ -362,6 +362,7 @@ fi
 if [[ "$NEED_MINIMAL_CFG" == "1" ]]; then
   SESS_SECRET=$(openssl rand -base64 48)
   STOR_KEY=$(openssl rand -base64 48)
+  RESET_JWT=$(openssl rand -hex 32)
   OIDC_RSA=""
   OIDC_RSA_ESCAPED=""
   OIDC_WEB_REDIRECT=""
@@ -440,7 +441,7 @@ session:
 
 identity_validation:
   reset_password:
-    disabled: true
+    jwt_secret: REPLACE_RESET_JWT
 YAML
   else
   cat > "$AUTHELIA_DIR/configuration.yml" <<YAML
@@ -483,7 +484,7 @@ session:
 
 identity_validation:
   reset_password:
-    disabled: true
+    jwt_secret: REPLACE_RESET_JWT
 
 identity_providers:
   oidc:
@@ -525,6 +526,7 @@ YAML
   sed -i "s|REPLACE_STORAGE_KEY|${STOR_KEY//|/\|}|" "$AUTHELIA_DIR/configuration.yml"
   sed -i "s|REPLACE_SESSION_SECRET|${SESS_SECRET//|/\|}|" "$AUTHELIA_DIR/configuration.yml"
   sed -i "s|__AUTHELIA_URL__|${AUTHELIA_URL//|/\|}|" "$AUTHELIA_DIR/configuration.yml"
+  sed -i "s|REPLACE_RESET_JWT|${RESET_JWT//|/\|}|" "$AUTHELIA_DIR/configuration.yml"
   success "Zapisano minimalny Authelia configuration.yml"
   # Walidacja konfiguracji zanim odpalimy stack
   if ! authelia_validate "$AUTHELIA_DIR/configuration.yml"; then
