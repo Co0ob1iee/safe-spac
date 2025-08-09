@@ -1,5 +1,5 @@
 # Build core-api
-FROM golang:1.22-alpine AS build
+FROM golang:1.23-alpine AS build
 WORKDIR /src
 COPY go.mod .
 # Pre-fetch modules and generate go.sum to avoid build failures on missing sums
