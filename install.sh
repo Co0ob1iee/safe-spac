@@ -24,9 +24,6 @@ check_port() {
   fi
 }
 
-check_port 80
-check_port 443
-
 if [[ ${NO_COLOR:-} != 1 ]] && [[ $ncolors -ge 8 ]]; then
   C_RESET="\033[0m"; C_BOLD="\033[1m"
   C_INFO="\033[36m"; C_WARN="\033[33m"; C_ERR="\033[31m"; C_OK="\033[32m"; C_DIM="\033[2m"
@@ -39,6 +36,10 @@ warn()    { printf "%b[WARN]%b %s\n"   "$C_WARN" "$C_RESET" "$*"; }
 error()   { printf "%b[ERR ]%b %s\n"   "$C_ERR" "$C_RESET" "$*"; }
 success() { printf "%b[ OK ]%b %s\n"   "$C_OK"  "$C_RESET" "$*"; }
 step()    { printf "%b==>%b %s\n"       "$C_BOLD" "$C_RESET" "$*"; }
+
+# Uruchom preflight dopiero po zdefiniowaniu funkcji logujących
+check_port 80
+check_port 443
 
 # --- Helpers: validation & self-tests ---
 authelia_validate() {
