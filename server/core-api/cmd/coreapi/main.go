@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
 	"github.com/gofiber/fiber/v2"
@@ -288,7 +289,7 @@ func restartAuthelia() error {
 		return fmt.Errorf("authelia container not found")
 	}
 	id := conts[0].ID
-	return cli.ContainerRestart(ctx, id, nil)
+	return cli.ContainerRestart(ctx, id, container.StopOptions{})
 }
 
 func firstNonEmpty(a, b string) string {
