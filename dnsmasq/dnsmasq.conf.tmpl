@@ -3,10 +3,18 @@
 # Private suffix: {{PRIVATE_SUFFIX}}
 
 no-resolv
+domain-needed
+bogus-priv
+server=1.1.1.1
+server=1.0.0.1
 listen-address=127.0.0.1
 listen-address=10.66.0.1
 bind-interfaces
 cache-size=1000
+
+# Private suffix
+local=/{{PRIVATE_SUFFIX}}/
+domain={{PRIVATE_SUFFIX}}
 
 # Internal hosts
 address=/portal.{{PRIVATE_SUFFIX}}/10.66.0.1

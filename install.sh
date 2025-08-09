@@ -243,6 +243,11 @@ EOF
 systemctl enable wg-quick@wg0 || true
 systemctl restart wg-quick@wg0 || systemctl start wg-quick@wg0
 
+# Dodaj peera admina (10.66.0.2/32) i utrwal konfigurację
+admin_pub=$(tr -d '\n' </etc/wireguard/admin.pub)
+wg set wg0 peer "$admin_pub" allowed-ips 10.66.0.2/32 || true
+wg-quick save wg0 || true
+
 # --- Konfiguracja resolvera systemowego na 10.66.0.1 (opcjonalnie) ---
 configure_resolver() {
   local WG_DNS="10.66.0.1"
@@ -297,6 +302,13 @@ if [[ ${FULL_TUNNEL:-N} =~ ^[Yy]$ ]]; then
   fi
   if ! iptables -C FORWARD -i wg0 -o "$WAN_IF" -j ACCEPT 2>/dev/null; then
     iptables -A FORWARD -i wg0 -o "$WAN_IF" -j ACCEPT
+  fi
+  # MSS clamping (PMTU) dla ruchu TCP przez WAN i wg0
+  if ! iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -o "$WAN_IF" -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
+    iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -o "$WAN_IF" -j TCPMSS --clamp-mss-to-pmtu
+  fi
+  if ! iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -o wg0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
+    iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -o wg0 -j TCPMSS --clamp-mss-to-pmtu
   fi
   # utrwal reguły
   netfilter-persistent save || true
@@ -586,7 +598,28 @@ popd >/dev/null
 
 # --- Admin WG klient ---
 mkdir -p "$INSTALL_ROOT/tools"
-sed "s/{{PUBLIC_IP}}/${PUBLIC_IP:-}/g" "$INSTALL_ROOT/tools/wg-client-sample.conf" > "$INSTALL_ROOT/tools/admin-wg.conf"
+{
+  admin_priv=$(tr -d '\n' </etc/wireguard/admin.key)
+  server_pub=$(tr -d '\n' </etc/wireguard/server.pub)
+  endpoint_host="${DOMAIN:-${PUBLIC_IP:-}}"
+  tmpf=$(mktemp)
+  sed \
+    -e "s|{{ENDPOINT_HOST}}|${endpoint_host}|g" \
+    -e "s|{{WG_PORT}}|${WG_PORT}|g" \
+    -e "s|{{CLIENT_PRIVATE_KEY}}|${admin_priv}|g" \
+    -e "s|{{SERVER_PUBLIC_KEY}}|${server_pub}|g" \
+    -e "s|{{ALLOWED_IPS}}|${ALLOWED_IPS}|g" \
+    "$INSTALL_ROOT/tools/wg-client-sample.conf" > "$tmpf"
+  install -m 600 "$tmpf" "$INSTALL_ROOT/tools/admin-wg.conf" || true
+  rm -f "$tmpf" || true
+  # Opcjonalny auto-upload na CachyOS (SSH), ustaw CACHYOS_SSH=user@host
+  if [[ -n "${CACHYOS_SSH:-}" ]]; then
+    info "Wysyłam profil WireGuard na ${CACHYOS_SSH}"
+    scp -o StrictHostKeyChecking=no "$INSTALL_ROOT/tools/admin-wg.conf" "${CACHYOS_SSH}:~/admin-wg.conf" || warn "scp nie powiodło się"
+    ssh -o StrictHostKeyChecking=no "${CACHYOS_SSH}" "mkdir -p ~/.config/wireguard && install -m 600 ~/admin-wg.conf ~/.config/wireguard/safe-spac.conf" || warn "zdalna instalacja pliku nie powiodła się"
+    success "Profil zainstalowany na ${CACHYOS_SSH}: ~/.config/wireguard/safe-spac.conf"
+  fi
+}
 
 cat <<EON
 
