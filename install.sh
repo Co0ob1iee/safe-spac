@@ -68,6 +68,10 @@ DNSMASQ_DIR="$INSTALL_ROOT/dnsmasq"
 DNSMASQ_CONF_SRC="$DNSMASQ_DIR/dnsmasq.conf.tmpl"
 DNSMASQ_CONF_DST="$DNSMASQ_DIR/dnsmasq.conf"
 
+# --- Opcje sterujące ---
+# Ustaw FORCE_AUTHELIA_MINIMAL=1 aby nadpisać istniejący configuration.yml minimalną konfiguracją
+FORCE_AUTHELIA_MINIMAL=${FORCE_AUTHELIA_MINIMAL:-0}
+
 # --- Instalacja zależności systemowych ---
 info "Instaluję zależności systemowe (curl, gnupg, lsb-release, apt-transport-https, ca-certificates)"
 
@@ -110,6 +114,20 @@ fi
 # --- Skopiowanie repo do /opt ---
 mkdir -p "$INSTALL_ROOT"
 rsync -a --delete --exclude .git --exclude build --exclude node_modules "$SCRIPT_DIR"/ "$INSTALL_ROOT"/
+
+# --- Kolizja portu 80 (hostowy nginx) ---
+if systemctl list-unit-files | grep -q '^nginx\.service'; then
+  if systemctl is-active --quiet nginx; then
+    warn "Wykryto działający nginx na hoście (port 80 może kolidować z Traefikiem)."
+    read -r -p "Czy zatrzymać i wyłączyć nginx teraz? (y/N): " DISABLE_NGINX || true
+    if [[ ${DISABLE_NGINX:-N} =~ ^[Yy]$ ]]; then
+      run_with_spinner "Stop nginx" systemctl stop nginx
+      run_with_spinner "Disable nginx" systemctl disable nginx
+    else
+      warn "Pozostawiono nginx włączony. Traefik może nie otrzymywać ruchu HTTP/80."
+    fi
+  fi
+fi
 
 # --- Konfiguracja WireGuard ---
 mkdir -p /etc/wireguard
@@ -190,15 +208,12 @@ sed "s/{{PRIVATE_SUFFIX}}/${PRIVATE_SUFFIX}/g" "$DNSMASQ_CONF_SRC" > "$DNSMASQ_C
 # --- Authelia: generacja hasła admina ---
 mkdir -p "$AUTHELIA_DIR"
 ADMIN_EMAIL="admin@example.com"
+step "Konfiguruję Authelię (użytkownik + minimalny configuration.yml)"
+# 1) Użytkownik admin
 if [[ ! -f "$AUTHELIA_DIR/users_database.yml" ]]; then
-  step "Generuję losowe hasło admina Authelii"
   ADMIN_PASS=$(openssl rand -base64 18)
   run_with_spinner "Pull authelia:4.38 (if needed)" bash -lc "docker image inspect authelia/authelia:4.38 >/dev/null 2>&1 || docker pull authelia/authelia:4.38"
   HASH=$(docker run --rm authelia/authelia:4.38 authelia crypto hash generate argon2 --password "$ADMIN_PASS" | tail -1 | sed 's/^.*: //')
-  # configuration.yml (jeśli nie istnieje)
-  if [[ ! -f "$AUTHELIA_DIR/configuration.yml" ]]; then
-    cp "$INSTALL_ROOT/server/authelia/configuration.yml" "$AUTHELIA_DIR/configuration.yml"
-  fi
   cat > "$AUTHELIA_DIR/users_database.yml" <<YML
 users:
   ${ADMIN_EMAIL}:
@@ -212,6 +227,64 @@ YML
   ADMIN_PASS_MSG="$ADMIN_PASS"
 else
   ADMIN_PASS_MSG="<niezmienione – istniejący plik>"
+fi
+
+# 2) Minimalny configuration.yml zgodny z Authelia v4 (bez OIDC, storage local)
+NEED_MINIMAL_CFG=0
+if [[ ! -f "$AUTHELIA_DIR/configuration.yml" ]]; then
+  NEED_MINIMAL_CFG=1
+elif [[ "$FORCE_AUTHELIA_MINIMAL" == "1" ]]; then
+  NEED_MINIMAL_CFG=1
+fi
+
+if [[ "$NEED_MINIMAL_CFG" == "1" ]]; then
+  SESS_SECRET=$(openssl rand -base64 48)
+  STOR_KEY=$(openssl rand -base64 48)
+  # backup jeśli istniał
+  if [[ -f "$AUTHELIA_DIR/configuration.yml" ]]; then
+    cp -v "$AUTHELIA_DIR/configuration.yml" "$AUTHELIA_DIR/configuration.yml.bak.$(date +%s)" || true
+  fi
+  cat > "$AUTHELIA_DIR/configuration.yml" <<'YAML'
+theme: light
+
+log:
+  level: info
+
+server:
+  address: 'tcp://0.0.0.0:9091'
+
+authentication_backend:
+  file:
+    path: /config/users_database.yml
+
+storage:
+  encryption_key: REPLACE_STORAGE_KEY
+  local:
+    path: /config/db.sqlite3
+
+notifier:
+  filesystem:
+    filename: /config/notification.txt
+
+access_control:
+  default_policy: one_factor
+  rules:
+    - domain: ['portal.safe.lan']
+      policy: one_factor
+
+session:
+  name: 'authelia_session'
+  secret: REPLACE_SESSION_SECRET
+  domain: 'safe.lan'
+  same_site: 'lax'
+  expiration: '1h'
+  inactivity: '5m'
+YAML
+  sed -i "s|REPLACE_STORAGE_KEY|${STOR_KEY//|/\|}|" "$AUTHELIA_DIR/configuration.yml"
+  sed -i "s|REPLACE_SESSION_SECRET|${SESS_SECRET//|/\|}|" "$AUTHELIA_DIR/configuration.yml"
+  success "Zapisano minimalny Authelia configuration.yml"
+else
+  info "Pozostawiono istniejący Authelia configuration.yml (ustaw FORCE_AUTHELIA_MINIMAL=1 aby nadpisać)"
 fi
 
 # --- Render docker-compose.yml ---
@@ -280,4 +353,5 @@ Profil WireGuard admina:
 
 Uwaga:
 - Jeśli używasz domeny, upewnij się, że rekord A wskazuje na IP serwera oraz port 80/443 są otwarte.
+ - Jeśli hostowy nginx jest uruchomiony, Traefik może nie przejąć portu 80. Rozważ wyłączenie nginx.
 EON
