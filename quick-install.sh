@@ -21,4 +21,8 @@ GIT_TERMINAL_PROMPT=0 git clone --depth 1 --branch "$BRANCH" "$REPO_URL" repo
 mv repo "$TARGET_DIR"
 cd "$TARGET_DIR"
 
-exec "$TARGET_DIR/install.sh"
+# ensure executables
+chmod +x "$TARGET_DIR/install.sh" 2>/dev/null || true
+chmod +x "$TARGET_DIR"/scripts/*.sh 2>/dev/null || true
+
+exec bash "$TARGET_DIR/install.sh"
