@@ -14,7 +14,7 @@ services:
       - traefik.enable=true
 
   dnsmasq:
-    image: andyshinn/dnsmasq:2.86
+    image: jpillora/dnsmasq:latest
     restart: unless-stopped
     network_mode: host
     volumes:
