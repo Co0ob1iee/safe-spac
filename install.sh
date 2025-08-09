@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Resolve script directory (so rsync works even when called via absolute path)
+SCRIPT_DIR="$(cd -- "$(dirname "$0")" >/dev/null 2>&1 && pwd -P)"
+
 # safe-spac installer (production-ready)
 # Usage (non-interactive):
 #   PUBLIC_IP=<IP> ./install.sh
@@ -65,7 +68,7 @@ fi
 
 # --- Skopiowanie repo do /opt ---
 mkdir -p "$INSTALL_ROOT"
-rsync -a --delete --exclude .git --exclude build --exclude node_modules ./ "$INSTALL_ROOT"/
+rsync -a --delete --exclude .git --exclude build --exclude node_modules "$SCRIPT_DIR"/ "$INSTALL_ROOT"/
 
 # --- Konfiguracja WireGuard ---
 mkdir -p /etc/wireguard
