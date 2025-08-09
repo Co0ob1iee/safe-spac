@@ -437,7 +437,10 @@ session:
       same_site: lax
       expiration: 1h
       inactivity: 5m
-      secure: true
+
+identity_validation:
+  reset_password:
+    disabled: true
 YAML
   else
   cat > "$AUTHELIA_DIR/configuration.yml" <<YAML
@@ -477,7 +480,10 @@ session:
       same_site: lax
       expiration: 1h
       inactivity: 5m
-      secure: true
+
+identity_validation:
+  reset_password:
+    disabled: true
 
 identity_providers:
   oidc:
