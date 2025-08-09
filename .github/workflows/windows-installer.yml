@@ -1,0 +1,23 @@
+name: Windows Installer
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'client/windows/**'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Inno Setup
+        uses: Minionguyjpro/Inno-Setup-Action@v1.2.5
+      - name: Build installer
+        run: |
+          ISCC.exe client/windows/Installer.iss
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SafeSpac-Setup
+          path: client/windows/SafeSpac-Setup.exe

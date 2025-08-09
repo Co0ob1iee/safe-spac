@@ -1,0 +1,26 @@
+# Minimal Authelia configuration (file backend)
+server:
+  address: 'tcp://0.0.0.0:9091'
+
+log:
+  level: info
+
+identity_providers:
+  oidc:
+    enabled: false
+
+storage:
+  local:
+    path: /config/db.sqlite3
+
+notifier:
+  filesystem:
+    filename: /config/notification.txt
+
+access_control:
+  default_policy: one_factor
+
+authentication_backend:
+  file:
+    path: /config/users_database.yml
+    watch: true

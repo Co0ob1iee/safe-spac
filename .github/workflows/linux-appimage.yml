@@ -1,0 +1,29 @@
+name: Linux AppImage
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'client/desktop/**'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install deps
+        run: |
+          cd client/desktop
+          npm ci
+      - name: Build AppImage
+        run: |
+          cd client/desktop
+          npm run dist:linux
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SafeSpac-AppImage
+          path: client/desktop/dist/*.AppImage

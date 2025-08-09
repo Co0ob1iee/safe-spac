@@ -1,0 +1,25 @@
+{
+  "name": "safe-spac-desktop",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Minimalny klient Electron (AppImage)",
+  "main": "src/main.js",
+  "author": "safe-spac",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "dist:linux": "electron-builder --linux AppImage"
+  },
+  "devDependencies": {
+    "electron": "29.4.0",
+    "electron-builder": "24.13.3"
+  },
+  "build": {
+    "appId": "lan.safe.spac",
+    "productName": "SafeSpac",
+    "linux": {
+      "target": ["AppImage"],
+      "category": "Network"
+    }
+  }
+}

@@ -1,0 +1,97 @@
+version: "3.9"
+
+services:
+  traefik:
+    image: traefik:2.11
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      # Add websecure for TLS later if domain available
+    ports:
+      - "80:80"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    labels:
+      - traefik.enable=true
+
+  dnsmasq:
+    image: ghcr.io/jpillora/dnsmasq:latest
+    network_mode: host
+    volumes:
+      - /opt/safe-spac/dnsmasq/dnsmasq.conf:/etc/dnsmasq.conf:ro
+    cap_add:
+      - NET_ADMIN
+
+  authelia:
+    image: authelia/authelia:4.38
+    restart: unless-stopped
+    volumes:
+      - /opt/safe-spac/authelia:/config
+
+  webapp:
+    build: ./webapp
+    labels:
+      - traefik.enable=true
+      # Public routes
+      - traefik.http.routers.webapp-public.rule=PathPrefix(`/`) || PathPrefix(`/register`) || PathPrefix(`/invite`)
+      - traefik.http.routers.webapp-public.entrypoints=web
+      - traefik.http.services.webapp.loadbalancer.server.port=80
+      # VPN-only routes (host header + ipWhitelist)
+      - traefik.http.middlewares.vpnonly-ipwhitelist.ipwhitelist.sourcerange={{WG_SUBNET}}
+      - traefik.http.routers.webapp-vpn.rule=Host(`portal.safe.lan`)
+      - traefik.http.routers.webapp-vpn.entrypoints=web
+      - traefik.http.routers.webapp-vpn.middlewares=vpnonly-ipwhitelist
+
+  core-api:
+    build: ./core-api
+    environment:
+      - PUBLIC_IP={{PUBLIC_IP}}
+      - DOCKER_HOST=tcp://docker-proxy:2375
+    depends_on:
+      - docker-proxy
+    volumes:
+      - /opt/safe-spac/server/data:/data
+      - /opt/safe-spac/authelia:/authelia
+    labels:
+      - traefik.enable=true
+      - traefik.http.middlewares.vpnonly-ipwhitelist.ipwhitelist.sourcerange={{WG_SUBNET}}
+      # Public API subset
+      - traefik.http.routers.coreapi-public.rule=PathPrefix(`/api/core/registration`) || PathPrefix(`/api/core/captcha`)
+      - traefik.http.routers.coreapi-public.entrypoints=web
+      - traefik.http.services.coreapi.loadbalancer.server.port=8080
+      # VPN-only
+      - traefik.http.routers.coreapi-vpn.rule=Host(`portal.safe.lan`)
+      - traefik.http.routers.coreapi-vpn.entrypoints=web
+      - traefik.http.routers.coreapi-vpn.middlewares=vpnonly-ipwhitelist
+
+  wg-provisioner:
+    build: ./wg-provisioner
+    environment:
+      - PUBLIC_IP={{PUBLIC_IP}}
+      - ALLOWED_IPS={{ALLOWED_IPS}}
+    volumes:
+      - /etc/wireguard:/etc/wireguard:ro
+
+  gitea:
+    image: gitea/gitea:1.22
+    volumes:
+      - /opt/safe-spac/server/gitea:/data
+    labels:
+      - traefik.enable=true
+      - traefik.http.middlewares.vpnonly-ipwhitelist.ipwhitelist.sourcerange={{WG_SUBNET}}
+      - traefik.http.routers.gitea-vpn.rule=Host(`service.git`)
+      - traefik.http.routers.gitea-vpn.entrypoints=web
+      - traefik.http.routers.gitea-vpn.middlewares=vpnonly-ipwhitelist
+
+  docker-proxy:
+    image: tecnativa/docker-socket-proxy:0.1.1
+    environment:
+      - CONTAINERS=1
+      - POST=1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+# Notes:
+# - WireGuard runs on host, not in compose (uses systemd wg-quick@wg0).
+# - TeamSpeak 6 started by /opt/safe-spac/server/teamspeak/install_ts6.sh when TS6_URL provided.
