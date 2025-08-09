@@ -1,5 +1,28 @@
 # safe-spac
 
+## Szybka instalacja (VPS Debian 12)
+
+- Bez domeny (HTTP):
+```bash
+curl -fsSL https://raw.githubusercontent.com/Co0ob1iee/safe-spac/main/quick-install.sh | sudo bash
+```
+
+- Z domeną (HTTPS + Let's Encrypt):
+```bash
+curl -fsSL https://raw.githubusercontent.com/Co0ob1iee/safe-spac/main/quick-install.sh | sudo HAS_DOMAIN=Y bash
+```
+
+- Przykład non-interactive (IP + full-tunnel):
+```bash
+curl -fsSL https://raw.githubusercontent.com/Co0ob1iee/safe-spac/main/quick-install.sh | \
+  sudo PUBLIC_IP=203.0.113.10 FULL_TUNNEL=Y bash
+```
+
+Zmiennie środowiskowe wspierane przez instalator:
+- `PUBLIC_IP` – IP serwera (gdy brak domeny lub tryb non-interactive)
+- `FULL_TUNNEL=Y|N` – włącza NAT oraz AllowedIPs=0.0.0.0/0
+- `WG_SUBNET`, `WG_ADDR`, `PRIVATE_SUFFIX` – nadpisanie domyślnych wartości
+
 1) Struktura projektu (drzewo + opis)
 
 safe-spac/
