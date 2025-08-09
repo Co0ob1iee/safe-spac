@@ -11,30 +11,6 @@ else
   ncolors=0
 fi
 
-# --- Render docker-compose and start stack (if template exists) ---
-COMPOSE_TMPL="$INSTALL_ROOT/server/docker-compose.yml.tmpl"
-COMPOSE_FILE="$INSTALL_ROOT/server/docker-compose.yml"
-if [[ -f "$COMPOSE_TMPL" ]]; then
-  step "Render docker-compose.yml"
-  cp "$COMPOSE_TMPL" "$COMPOSE_FILE"
-  step "Start Docker stack"
-  run_with_spinner "docker compose up -d" bash -lc "cd '$INSTALL_ROOT/server' && docker compose -f '$COMPOSE_FILE' up -d"
-
-  # Basic health checks
-  step "Health checks"
-  # helper: wait for container running
-  wait_container() { local n="$1"; local t=${2:-60}; local i=0; while [[ $i -lt $t ]]; do if docker ps --format '{{.Names}}' | grep -q "^${n}$"; then return 0; fi; sleep 1; i=$((i+1)); done; return 1; }
-  for svc in traefik authelia core-api dnsmasq; do
-    if wait_container "$svc" 20; then success "container up: $svc"; else warn "container not detected (yet): $svc"; fi
-  done
-  # Port checks (if no domain, HTTP only)
-  if command -v nc >/dev/null 2>&1; then
-    nc -z 127.0.0.1 80 >/dev/null 2>&1 && success "port 80 open" || warn "port 80 not open"
-  fi
-else
-  warn "Brak szablonu docker-compose.yml.tmpl – pomijam uruchomienie stosu"
-fi
-
 if [[ ${NO_COLOR:-} != 1 ]] && [[ $ncolors -ge 8 ]]; then
   C_RESET="\033[0m"; C_BOLD="\033[1m"
   C_INFO="\033[36m"; C_WARN="\033[33m"; C_ERR="\033[31m"; C_OK="\033[32m"; C_DIM="\033[2m"
