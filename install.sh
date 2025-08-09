@@ -11,6 +11,22 @@ else
   ncolors=0
 fi
 
+# --- Preflight: sprawdź, czy porty 80/443 są wolne ---
+check_port() {
+  local p=$1
+  if ss -tlnp 2>/dev/null | awk -v P=":${p}" '$4 ~ P {print}' | grep -q ":${p} "; then
+    warn "Port ${p} jest aktualnie zajęty przez:" 
+    ss -tlnp | awk -v P=":${p}" '$4 ~ P {print "  -", $0}'
+    echo ""
+    echo "Aby Traefik mógł wystartować, zwolnij port ${p}. Jeśli to nginx: systemctl stop nginx && systemctl disable nginx"
+  else
+    success "Port ${p} jest wolny"
+  fi
+}
+
+check_port 80
+check_port 443
+
 if [[ ${NO_COLOR:-} != 1 ]] && [[ $ncolors -ge 8 ]]; then
   C_RESET="\033[0m"; C_BOLD="\033[1m"
   C_INFO="\033[36m"; C_WARN="\033[33m"; C_ERR="\033[31m"; C_OK="\033[32m"; C_DIM="\033[2m"
