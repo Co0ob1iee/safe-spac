@@ -189,11 +189,18 @@ RCF
   fi
 }
 
-# zapytaj użytkownika, czy ustawić resolver teraz
-read -r -p "Ustawić systemowy resolver DNS na 10.66.0.1? (y/N): " SET_RESOLVER || true
-if [[ ${SET_RESOLVER:-N} =~ ^[Yy]$ ]]; then
-  configure_resolver || true
+# Ustaw resolver interaktywnie, chyba że SET_RESOLVER jest już ustawione w env
+if [[ -z "${SET_RESOLVER:-}" ]]; then
+  read -r -p "Ustawić systemowy resolver DNS na 10.66.0.1? (y/N): " SET_RESOLVER || true
 fi
+case "${SET_RESOLVER}" in
+  1|Y|y|yes|YES)
+    configure_resolver || true
+    ;;
+  *)
+    info "Pominięto zmianę resolvera (SET_RESOLVER nieaktywny)"
+    ;;
+esac
 
 # --- NAT / full-tunnel (opcjonalnie) ---
 if [[ -z "$FULL_TUNNEL" ]]; then
