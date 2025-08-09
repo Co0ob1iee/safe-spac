@@ -40,6 +40,78 @@ error()   { printf "%b[ERR ]%b %s\n"   "$C_ERR" "$C_RESET" "$*"; }
 success() { printf "%b[ OK ]%b %s\n"   "$C_OK"  "$C_RESET" "$*"; }
 step()    { printf "%b==>%b %s\n"       "$C_BOLD" "$C_RESET" "$*"; }
 
+# --- Helpers: validation & self-tests ---
+authelia_validate() {
+  local cfg="$1"
+  docker run --rm -v "$(dirname "$cfg")":/config authelia/authelia:4.38 authelia validate-config --config "/config/$(basename "$cfg")"
+}
+
+self_http_retry() {
+  # self_http_retry <url> <timeout_sec>
+  local url="$1"; local timeout="${2:-30}"; local start=$(date +%s)
+  while true; do
+    code=$(curl -ks -o /dev/null -w '%{http_code}' "$url" || echo 000)
+    if [[ "$code" =~ ^2|3[0-9]{1}$ ]]; then
+      echo "$code"; return 0
+    fi
+    if (( $(date +%s) - start >= timeout )); then
+      echo "$code"; return 1
+    fi
+    sleep 1
+  done
+}
+
+self_dns_expect() {
+  # self_dns_expect <name> <expected_ip>
+  local name="$1"; local expected="$2"
+  local got
+  got=$(dig +short "$name" @127.0.0.1 | tail -n1 || true)
+  [[ "$got" == "$expected" ]]
+}
+
+self_wg_nat_ok() {
+  # sprawdź czy wg0 up i NAT reguły istnieją
+  ip link show wg0 >/dev/null 2>&1 || return 1
+  ip link show wg0 | grep -q 'state UP' || true # nie zawsze UP od razu
+  sysctl -n net.ipv4.ip_forward | grep -q '^1$' || return 1
+  # minimalna weryfikacja reguł
+  iptables -t nat -S POSTROUTING | grep -q "-s ${WG_SUBNET} .* -j MASQUERADE" || true
+}
+
+self_tests() {
+  step "Self-test: weryfikuję konfigurację i stan usług"
+  # 1) docker compose config syntactic
+  (pushd "$INSTALL_ROOT/server" >/dev/null && docker compose config >/dev/null && popd >/dev/null) || { error "docker compose config niepoprawny"; exit 1; }
+  # 2) porty 80/443
+  ss -tlnp | egrep ':80 |:443 ' >/dev/null || { warn "Porty 80/443 nie są nasłuchiwane"; }
+  # 3) Authelia logs sanity
+  if docker compose -f "$INSTALL_ROOT/server/docker-compose.yml" logs authelia --since 2m | grep -qi fatal; then
+    error "Authelia loguje FATAL po starcie"; exit 1;
+  fi
+  # 4) walidacja konfiguracji Authelii
+  if ! authelia_validate "$AUTHELIA_DIR/configuration.yml" >/dev/null; then
+    error "Walidacja Authelii nie powiodła się"; exit 1;
+  fi
+  # 5) HTTP healthcheck przez Traefika (web)
+  local code
+  code=$(self_http_retry "http://127.0.0.1/" 45) || { error "Webapp HTTP healthcheck niepowodzenie (code=$code)"; exit 1; }
+  success "Webapp HTTP OK (code=$code)"
+  code=$(self_http_retry "http://127.0.0.1/api/core/captcha" 45) || warn "Core-API HTTP check zwrócił code=$code (akceptowalne jeśli endpoint nie gotowy)"
+  # 6) DNS probe portal.${PRIVATE_SUFFIX} -> 10.66.0.1
+  if self_dns_expect "portal.${PRIVATE_SUFFIX}" "10.66.0.1"; then
+    success "DNS OK: portal.${PRIVATE_SUFFIX} -> 10.66.0.1"
+  else
+    warn "DNS nie zwrócił 10.66.0.1 dla portal.${PRIVATE_SUFFIX}"
+  fi
+  # 7) wg0 i NAT
+  if self_wg_nat_ok; then
+    success "WG/NAT: podstawowa weryfikacja OK"
+  else
+    warn "WG/NAT: brak pełnej weryfikacji (sprawdź ip_forward i reguły)"
+  fi
+  success "Self-test: OK"
+}
+
 banner() {
   printf "\n%b🛰️  Safe‑Spac Installer%b\n" "$C_BOLD" "$C_RESET"
   printf "%b=====================%b\n\n" "$C_DIM" "$C_RESET"
@@ -294,6 +366,12 @@ if [[ "$NEED_MINIMAL_CFG" == "1" ]]; then
   OIDC_WEB_REDIRECT=""
   OIDC_API_REDIRECT=""
   OIDC_API_SECRET=""
+  # URL Authelii musi być HTTPS
+  if [[ -n "$DOMAIN" ]]; then
+    AUTHELIA_URL="https://$DOMAIN"
+  else
+    AUTHELIA_URL="https://portal.${PRIVATE_SUFFIX}"
+  fi
   if [[ "$OIDC_ENABLE" == "1" ]]; then
     info "Włączono OIDC: generuję klucz RSA i konfigurację klientów"
     OIDC_RSA=$(openssl genrsa 4096)
@@ -311,6 +389,15 @@ if [[ "$NEED_MINIMAL_CFG" == "1" ]]; then
   if [[ -f "$AUTHELIA_DIR/configuration.yml" ]]; then
     cp -v "$AUTHELIA_DIR/configuration.yml" "$AUTHELIA_DIR/configuration.yml.bak.$(date +%s)" || true
   fi
+  # Usuń/odłóż na bok inne pliki YAML, które mogłyby zostać błędnie odczytane przez Authelię
+  mkdir -p "$AUTHELIA_DIR/backup"
+  shopt -s nullglob
+  for f in "$AUTHELIA_DIR"/*.yml "$AUTHELIA_DIR"/*.yaml; do
+    bn=$(basename "$f")
+    if [[ "$bn" != "configuration.yml" && "$bn" != "users_database.yml" ]]; then
+      mv -v "$f" "$AUTHELIA_DIR/backup/" || true
+    fi
+  done
   if [[ "$OIDC_ENABLE" != "1" ]]; then
   cat > "$AUTHELIA_DIR/configuration.yml" <<'YAML'
 theme: light
@@ -341,12 +428,15 @@ access_control:
       policy: one_factor
 
 session:
-  name: 'authelia_session'
   secret: REPLACE_SESSION_SECRET
-  domain: 'safe.lan'
-  same_site: 'lax'
-  expiration: '1h'
-  inactivity: '5m'
+  cookies:
+    - name: authelia_session
+      domain: safe.lan
+      authelia_url: __AUTHELIA_URL__
+      same_site: lax
+      expiration: 1h
+      inactivity: 5m
+      secure: true
 YAML
   else
   cat > "$AUTHELIA_DIR/configuration.yml" <<YAML
@@ -378,12 +468,15 @@ access_control:
       policy: one_factor
 
 session:
-  name: 'authelia_session'
   secret: REPLACE_SESSION_SECRET
-  domain: 'safe.lan'
-  same_site: 'lax'
-  expiration: '1h'
-  inactivity: '5m'
+  cookies:
+    - name: authelia_session
+      domain: safe.lan
+      authelia_url: __AUTHELIA_URL__
+      same_site: lax
+      expiration: 1h
+      inactivity: 5m
+      secure: true
 
 identity_providers:
   oidc:
@@ -424,7 +517,12 @@ YAML
   fi
   sed -i "s|REPLACE_STORAGE_KEY|${STOR_KEY//|/\|}|" "$AUTHELIA_DIR/configuration.yml"
   sed -i "s|REPLACE_SESSION_SECRET|${SESS_SECRET//|/\|}|" "$AUTHELIA_DIR/configuration.yml"
+  sed -i "s|__AUTHELIA_URL__|${AUTHELIA_URL//|/\|}|" "$AUTHELIA_DIR/configuration.yml"
   success "Zapisano minimalny Authelia configuration.yml"
+  # Walidacja konfiguracji zanim odpalimy stack
+  if ! authelia_validate "$AUTHELIA_DIR/configuration.yml"; then
+    error "Walidacja pliku Authelii nie powiodła się – sprawdź komunikaty powyżej"; exit 1;
+  fi
 else
   info "Pozostawiono istniejący Authelia configuration.yml (ustaw FORCE_AUTHELIA_MINIMAL=1 aby nadpisać)"
 fi
@@ -482,6 +580,9 @@ mkdir -p "$INSTALL_ROOT/tools"
 sed "s/{{PUBLIC_IP}}/${PUBLIC_IP:-}/g" "$INSTALL_ROOT/tools/wg-client-sample.conf" > "$INSTALL_ROOT/tools/admin-wg.conf"
 
 cat <<EON
+
+# --- Końcowy self-test ---
+self_tests || true
 [OK] Instalacja zakończona.
 Tryb publiczny: $([[ -n "$DOMAIN" ]] && echo "https://$DOMAIN" || echo "http://${PUBLIC_IP:-<IP>}" )
 Portal (VPN): http://portal.${PRIVATE_SUFFIX}

@@ -14,9 +14,12 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     cd cmd/coreapi && go build -o /out/coreapi
 
 FROM alpine:3.20
-RUN adduser -D app
+RUN apk add --no-cache curl \
+    && adduser -D app
 USER app
 WORKDIR /app
 COPY --from=build /out/coreapi /app/coreapi
 EXPOSE 8080
 ENTRYPOINT ["/app/coreapi"]
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+  CMD curl -fsS http://localhost:8080/ >/dev/null || exit 1
