@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"math/big"
 	"net/http"
@@ -35,71 +34,7 @@ var (
 	autheliaUsers    = envOr("AUTHELIA_USERS", "/authelia/users_database.yml")
 	wgProvisionerURL = envOr("WG_PROVISIONER_URL", "http://wg-provisioner:8081")
 	captchaStore     sync.Map
-)
-
-const captchaExpiration = 2 * time.Minute
-
-type Registration struct {
-	Email       string    `json:"email"`
-	DisplayName string    `json:"displayname"`
-	CreatedAt   time.Time `json:"created_at"`
-	Status      string    `json:"status"`
-}
-
-type Invite struct {
-	Token     string    `json:"token"`
-	Email     string    `json:"email,omitempty"`
-	ExpiresAt time.Time `json:"expires_at"`
-	CreatedAt time.Time `json:"created_at"`
-}
-
-type usersDB struct {
-	Users map[string]userEntry `yaml:"users"`
-}
-
-type userEntry struct {
-	DisplayName string   `yaml:"displayname"`
-	Password    string   `yaml:"password"`
-	Email       string   `yaml:"email"`
-	Groups      []string `yaml:"groups"`
-}
-
-func main() {
-	app := fiber.New()
-
-	ensureDataFiles()
-
-	app.Get("/api/core/health", func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{
-			"status":  "ok",
-			"time":    time.Now().UTC().Format(time.RFC3339),
-			"version": "0.1.0",
-		})
-	})
-
-	// Public endpoints
-	app.Post("/api/core/registration/submit", handleRegistrationSubmit)
-	app.Get("/api/core/captcha/challenge", handleCaptchaChallenge)
-	app.Post("/api/core/captcha/verify", handleCaptchaVerify)
-
-	// VPN-only endpoints (assumed protected by Traefik ipwhitelist)
-	app.Post("/api/core/admin/accept", handleAdminAccept)
-	app.Post("/api/core/invite/create", handleInviteCreate)
-	app.Post("/api/core/vpn/issue", handleVPNIssue)
-
-	addr := envOr("COREAPI_ADDR", ":8080")
-	log.Printf("core-api listening on %s", addr)
-	if err := app.Listen(addr); err != nil {
-		log.Fatal(err)
-	}
-}
-
-func handleRegistrationSubmit(c *fiber.Ctx) error {
-	var req Registration
-	if err := c.BodyParser(&req); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid json")
-	}
-	if req.Email == "" {
+@@ -103,150 +102,263 @@ func handleRegistrationSubmit(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "email required")
 	}
 	req.CreatedAt = time.Now().UTC()
@@ -125,6 +60,66 @@ type captchaEntry struct {
 	expiresAt  time.Time
 }
 
+type captchaFileEntry struct {
+	AnswerHash string    `json:"answer_hash"`
+	ExpiresAt  time.Time `json:"expires_at"`
+}
+
+func captchaStoreFile() string {
+	return filepath.Join(dataDir, "captcha_store.json")
+}
+
+func saveCaptchaStore() error {
+	m := make(map[string]captchaFileEntry)
+	captchaStore.Range(func(k, v any) bool {
+		entry := v.(captchaEntry)
+		m[k.(string)] = captchaFileEntry{
+			AnswerHash: base64.StdEncoding.EncodeToString(entry.answerHash),
+			ExpiresAt:  entry.expiresAt,
+		}
+		return true
+	})
+	return writeJSON(captchaStoreFile(), m)
+}
+
+func loadCaptchaStore() error {
+	var m map[string]captchaFileEntry
+	if err := readJSON(captchaStoreFile(), &m); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	now := time.Now()
+	for k, v := range m {
+		if now.After(v.ExpiresAt) {
+			continue
+		}
+		hash, err := base64.StdEncoding.DecodeString(v.AnswerHash)
+		if err != nil {
+			continue
+		}
+		captchaStore.Store(k, captchaEntry{answerHash: hash, expiresAt: v.ExpiresAt})
+	}
+	return saveCaptchaStore()
+}
+
+func cleanupExpiredCaptchas() {
+	now := time.Now()
+	changed := false
+	captchaStore.Range(func(k, v any) bool {
+		entry := v.(captchaEntry)
+		if now.After(entry.expiresAt) {
+			captchaStore.Delete(k)
+			changed = true
+		}
+		return true
+	})
+	if changed {
+		_ = saveCaptchaStore()
+	}
+}
+
 func handleCaptchaChallenge(c *fiber.Ctx) error {
 	a, err := cryptoRandomInt(9)
 	if err != nil {
@@ -143,6 +138,9 @@ func handleCaptchaChallenge(c *fiber.Ctx) error {
 	}
 	hash := sha256.Sum256([]byte(strconv.Itoa(sum)))
 	captchaStore.Store(id, captchaEntry{answerHash: hash[:], expiresAt: time.Now().Add(captchaExpiration)})
+	if err := saveCaptchaStore(); err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "persist failed")
+	}
 	return c.JSON(captchaChallenge{ID: id, Question: fmt.Sprintf("%d + %d", a, b)})
 }
 
@@ -161,6 +159,7 @@ func handleCaptchaVerify(c *fiber.Ctx) error {
 	entry := val.(captchaEntry)
 	if time.Now().After(entry.expiresAt) {
 		captchaStore.Delete(req.ID)
+		_ = saveCaptchaStore()
 		return fiber.NewError(fiber.StatusBadRequest, "expired captcha")
 	}
 	hash := sha256.Sum256([]byte(strconv.Itoa(req.Answer)))
@@ -168,6 +167,9 @@ func handleCaptchaVerify(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid answer")
 	}
 	captchaStore.Delete(req.ID)
+	if err := saveCaptchaStore(); err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "persist failed")
+	}
 	return c.JSON(fiber.Map{"ok": true})
 }
 
@@ -208,7 +210,6 @@ func handleInviteCreate(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
 	return c.JSON(fiber.Map{"ok": true, "token": inv.Token, "expires_at": inv.ExpiresAt})
-@@ -276,25 +347,41 @@ func restartAuthelia() error {
 	defer cancel()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
@@ -235,18 +236,65 @@ func firstNonEmpty(a, b string) string {
 	return b
 }
 
+func envOr(key, def string) string {
+	if v := os.Getenv(key); strings.TrimSpace(v) != "" {
+		return v
+	}
+	return def
+}
+
+func randomToken(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+func readJSON(path string, v any) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return json.NewDecoder(f).Decode(v)
+}
+
+func writeJSON(path string, v any) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(f)
+	if err := enc.Encode(v); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func ensureDataFiles() {
+	_ = os.MkdirAll(dataDir, 0o755)
+	if err := loadCaptchaStore(); err != nil {
+		log.Printf("captcha load failed: %v", err)
+	}
+	cleanupExpiredCaptchas()
+}
+
 func init() {
 	go func() {
 		for {
 			time.Sleep(time.Minute)
-			now := time.Now()
-			captchaStore.Range(func(k, v any) bool {
-				entry := v.(captchaEntry)
-				if now.After(entry.expiresAt) {
-					captchaStore.Delete(k)
-				}
-				return true
-			})
+			cleanupExpiredCaptchas()
 		}
 	}()
 }
