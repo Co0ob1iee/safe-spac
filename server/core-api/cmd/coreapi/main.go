@@ -1,18 +1,23 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/docker/docker/api/types"
@@ -26,10 +31,13 @@ import (
 
 // Paths and config
 var (
-	dataDir         = envOr("DATA_DIR", "/data")
-	autheliaUsers   = envOr("AUTHELIA_USERS", "/authelia/users_database.yml")
+	dataDir          = envOr("DATA_DIR", "/data")
+	autheliaUsers    = envOr("AUTHELIA_USERS", "/authelia/users_database.yml")
 	wgProvisionerURL = envOr("WG_PROVISIONER_URL", "http://wg-provisioner:8081")
+	captchaStore     sync.Map
 )
+
+const captchaExpiration = 2 * time.Minute
 
 type Registration struct {
 	Email       string    `json:"email"`
@@ -71,9 +79,8 @@ func main() {
 
 	// Public endpoints
 	app.Post("/api/core/registration/submit", handleRegistrationSubmit)
-	app.Get("/api/core/captcha/challenge", func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{"captcha": "stub"})
-	})
+	app.Get("/api/core/captcha/challenge", handleCaptchaChallenge)
+	app.Post("/api/core/captcha/verify", handleCaptchaVerify)
 
 	// VPN-only endpoints (assumed protected by Traefik ipwhitelist)
 	app.Post("/api/core/admin/accept", handleAdminAccept)
@@ -108,10 +115,74 @@ func handleRegistrationSubmit(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"ok": true})
 }
 
+type captchaChallenge struct {
+	ID       string `json:"id"`
+	Question string `json:"question"`
+}
+
+type captchaEntry struct {
+	answerHash []byte
+	expiresAt  time.Time
+}
+
+func handleCaptchaChallenge(c *fiber.Ctx) error {
+	a, err := cryptoRandomInt(9)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "rng failed")
+	}
+	b, err := cryptoRandomInt(9)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "rng failed")
+	}
+	a++
+	b++
+	sum := a + b
+	id, err := randomToken(8)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "token gen failed")
+	}
+	hash := sha256.Sum256([]byte(strconv.Itoa(sum)))
+	captchaStore.Store(id, captchaEntry{answerHash: hash[:], expiresAt: time.Now().Add(captchaExpiration)})
+	return c.JSON(captchaChallenge{ID: id, Question: fmt.Sprintf("%d + %d", a, b)})
+}
+
+func handleCaptchaVerify(c *fiber.Ctx) error {
+	var req struct {
+		ID     string `json:"id"`
+		Answer int    `json:"answer"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid json")
+	}
+	val, ok := captchaStore.Load(req.ID)
+	if !ok {
+		return fiber.NewError(fiber.StatusBadRequest, "unknown captcha")
+	}
+	entry := val.(captchaEntry)
+	if time.Now().After(entry.expiresAt) {
+		captchaStore.Delete(req.ID)
+		return fiber.NewError(fiber.StatusBadRequest, "expired captcha")
+	}
+	hash := sha256.Sum256([]byte(strconv.Itoa(req.Answer)))
+	if !bytes.Equal(hash[:], entry.answerHash) {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid answer")
+	}
+	captchaStore.Delete(req.ID)
+	return c.JSON(fiber.Map{"ok": true})
+}
+
+func cryptoRandomInt(max int) (int, error) {
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(max)))
+	if err != nil {
+		return 0, err
+	}
+	return int(n.Int64()), nil
+}
+
 func handleInviteCreate(c *fiber.Ctx) error {
 	var req struct {
-		Email     string `json:"email"`
-		ExpiresH  int    `json:"expires_hours"`
+		Email    string `json:"email"`
+		ExpiresH int    `json:"expires_hours"`
 	}
 	if err := c.BodyParser(&req); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid json")
@@ -137,142 +208,7 @@ func handleInviteCreate(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
 	return c.JSON(fiber.Map{"ok": true, "token": inv.Token, "expires_at": inv.ExpiresAt})
-}
-
-func handleAdminAccept(c *fiber.Ctx) error {
-	var req struct {
-		Email       string `json:"email"`
-		DisplayName string `json:"displayname"`
-		Password    string `json:"password"`
-	}
-	if err := c.BodyParser(&req); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid json")
-	}
-	if req.Email == "" {
-		return fiber.NewError(fiber.StatusBadRequest, "email required")
-	}
-	passGenerated := false
-	if req.Password == "" {
-		p, err := randomToken(18)
-		if err != nil {
-			return fiber.NewError(fiber.StatusInternalServerError, "password gen failed")
-		}
-		req.Password = p
-		passGenerated = true
-	}
-	hash, err := autheliaHashArgon2id(req.Password)
-	if err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
-	}
-	if err := upsertAutheliaUser(req.Email, req.DisplayName, hash); err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
-	}
-	if err := restartAuthelia(); err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, "restart authelia failed: "+err.Error())
-	}
-	resp := fiber.Map{"ok": true}
-	if passGenerated {
-		resp["password"] = req.Password
-	}
-	return c.JSON(resp)
-}
-
-func handleVPNIssue(c *fiber.Ctx) error {
-	url := strings.TrimRight(wgProvisionerURL, "/") + "/issue"
-	resp, err := http.Post(url, "application/json", strings.NewReader("{}"))
-	if err != nil {
-		return fiber.NewError(fiber.StatusBadGateway, "provisioner unavailable")
-	}
-	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
-	c.Set("Content-Type", "text/plain; charset=utf-8")
-	return c.Send(b)
-}
-
-// Helpers
-func ensureDataFiles() {
-	_ = os.MkdirAll(dataDir, 0o755)
-	for _, f := range []string{"pending.json", "invites.json"} {
-		path := filepath.Join(dataDir, f)
-		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
-			_ = os.WriteFile(path, []byte("[]"), 0o644)
-		}
-	}
-}
-
-func readJSON(path string, v any) error {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	return json.Unmarshal(b, v)
-}
-
-func writeJSON(path string, v any) error {
-	b, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, b, 0o644)
-}
-
-func envOr(k, def string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
-	return def
-}
-
-func randomToken(n int) (string, error) {
-	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(b), nil
-}
-
-func autheliaHashArgon2id(password string) (string, error) {
-	// Parameters compatible with Authelia defaults: t=3, m=65536, p=4, salt=16, keyLen=32
-	salt := make([]byte, 16)
-	if _, err := rand.Read(salt); err != nil {
-		return "", err
-	}
-	key := argon2.IDKey([]byte(password), salt, 3, 64*1024, 4, 32)
-	return fmt.Sprintf("$argon2id$v=19$m=65536,t=3,p=4$%s$%s",
-		base64.RawStdEncoding.EncodeToString(salt),
-		base64.RawStdEncoding.EncodeToString(key),
-	), nil
-}
-
-func upsertAutheliaUser(email, display, hash string) error {
-	// Load YAML
-	db := usersDB{Users: map[string]userEntry{}}
-	if b, err := os.ReadFile(autheliaUsers); err == nil {
-		_ = yaml.Unmarshal(b, &db)
-	}
-	if db.Users == nil {
-		db.Users = map[string]userEntry{}
-	}
-	entry := userEntry{
-		DisplayName: firstNonEmpty(display, email),
-		Password:    hash,
-		Email:       email,
-		Groups:      []string{"users"},
-	}
-	// Keep admins if already present for admin@example.com
-	if cur, ok := db.Users[email]; ok && len(cur.Groups) > 0 {
-		entry.Groups = cur.Groups
-	}
-	db.Users[email] = entry
-	out, err := yaml.Marshal(&db)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(autheliaUsers, out, 0o644)
-}
-
-func restartAuthelia() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+@@ -276,25 +347,41 @@ func restartAuthelia() error {
 	defer cancel()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
@@ -297,4 +233,20 @@ func firstNonEmpty(a, b string) string {
 		return a
 	}
 	return b
+}
+
+func init() {
+	go func() {
+		for {
+			time.Sleep(time.Minute)
+			now := time.Now()
+			captchaStore.Range(func(k, v any) bool {
+				entry := v.(captchaEntry)
+				if now.After(entry.expiresAt) {
+					captchaStore.Delete(k)
+				}
+				return true
+			})
+		}
+	}()
 }
