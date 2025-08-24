@@ -5,6 +5,10 @@ server:
 log:
   level: info
 
+session:
+  domain: safe.lan
+  authelia_url: https://auth.safe.lan
+
 identity_providers:
   oidc:
     enabled: false
