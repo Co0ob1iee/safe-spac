@@ -93,6 +93,20 @@ Key networks and defaults:
 
 ---
 
+## 🔑 Regenerating Authelia admin password
+
+The installer creates `admin@example.com` with a random password and stores its Argon2id hash in `server/authelia/users_database.yml`.
+To change this password later, generate a new hash and replace the value in that file:
+
+```bash
+docker run --rm authelia/authelia:4.38 \
+  authelia crypto hash generate argon2 --password "NEW_PASSWORD"
+```
+
+Copy the produced `$argon2id$...` string into `server/authelia/users_database.yml` under the `password` field for `admin@example.com` and restart the Authelia container.
+
+---
+
 ## 📦 Project Layout
 
 ```
