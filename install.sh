@@ -130,6 +130,18 @@ check_port() {
   log_debug "Sprawdzam port $port"
   
   if ss -tlnp 2>/dev/null | awk -v P=":${port}" '$4 ~ P {print}' | grep -q ":${port} "; then
+    # Check if it's Traefik (docker-proxy) - this is OK!
+    if ss -tlnp | awk -v P=":${port}" '$4 ~ P {print}' | grep -q "docker-proxy"; then
+      log_success "Port $port jest używany przez Traefik (docker-proxy) - to jest OK!"
+      return 0
+    fi
+    
+    # Check if it's our own Docker containers
+    if ss -tlnp | awk -v P=":${port}" '$4 ~ P {print}' | grep -q "server-"; then
+      log_success "Port $port jest używany przez nasze usługi Safe-Spac - to jest OK!"
+      return 0
+    fi
+    
     log_warn "Port $port jest zajęty przez $service_name"
     ss -tlnp | awk -v P=":${port}" '$4 ~ P {print "  -", $0}' || true
     
@@ -153,6 +165,7 @@ check_port() {
       log_info "Wykryto apache2 - próbuję zatrzymać"
       if systemctl stop apache2 2>/dev/null; then
         log_success "Apache2 zatrzymany"
+        stopped_services+=("apache2")
         stopped_services+=("apache2")
         if systemctl disable apache2 2>/dev/null; then
           log_success "Apache2 wyłączony"
@@ -188,7 +201,18 @@ check_port() {
     
     # Check again
     if ss -tlnp 2>/dev/null | awk -v P=":${port}" '$4 ~ P {print}' | grep -q ":${port} "; then
-      log_warn "Port $port nadal zajęty po próbie zwolnienia"
+      # Check again if it's now Traefik or our services
+      if ss -tlnp | awk -v P=":${port}" '$4 ~ P {print}' | grep -q "docker-proxy"; then
+        log_success "Port $port jest teraz używany przez Traefik - problem rozwiązany!"
+        return 0
+      fi
+      
+      if ss -tlnp | awk -v P=":${port}" '$4 ~ P {print}' | grep -q "server-"; then
+        log_success "Port $port jest teraz używany przez nasze usługi - problem rozwiązany!"
+        return 0
+      fi
+      
+      log_warn "Port $port nadal zajęty przez inne usługi po próbie zwolnienia"
       log_info "Zatrzymane usługi: ${stopped_services[*]}"
       log_info "Sprawdzam co jeszcze może blokować port:"
       ss -tlnp | awk -v P=":${port}" '$4 ~ P {print "  -", $0}' || true
@@ -304,24 +328,50 @@ run_self_tests() {
   log_info "Testuję dostępność portów..."
   local port_test_passed=true
   
-  if ! check_port 80 "HTTP"; then
-    test_results+=("Porty 80/443: FAILED")
-    port_test_passed=false
-    log_warn "Port 80 jest zajęty - Traefik może nie działać poprawnie"
-    
-    # Show what's using port 80
-    log_info "Co używa portu 80:"
-    ss -tlnp | grep ":80" || true
-    
-    # Show running web services
-    log_info "Uruchomione usługi web:"
-    systemctl list-units --type=service --state=running | grep -E "(nginx|apache|http|web)" || true
+  # Check if ports are used by Traefik (which is OK)
+  local port_80_status=$(ss -tlnp 2>/dev/null | awk '/:80 / {print $0}' | head -1)
+  local port_443_status=$(ss -tlnp 2>/dev/null | awk '/:443 / {print $0}' | head -1)
+  
+  if [[ -n "$port_80_status" ]]; then
+    if echo "$port_80_status" | grep -q "docker-proxy"; then
+      log_success "Port 80 jest używany przez Traefik (docker-proxy) - to jest OK!"
+      test_results+=("Port 80: OK (Traefik)")
+    elif echo "$port_80_status" | grep -q "server-"; then
+      log_success "Port 80 jest używany przez nasze usługi Safe-Spac - to jest OK!"
+      test_results+=("Port 80: OK (Safe-Spac)")
+    else
+      test_results+=("Porty 80/443: FAILED")
+      port_test_passed=false
+      log_warn "Port 80 jest zajęty przez inne usługi - może powodować problemy"
+      
+      # Show what's using port 80
+      log_info "Co używa portu 80:"
+      ss -tlnp | grep ":80" || true
+      
+      # Show running web services
+      log_info "Uruchomione usługi web:"
+      systemctl list-units --type=service --state=running | grep -E "(nginx|apache|http|web)" || true
+    fi
+  else
+    log_warn "Port 80 nie jest używany - Traefik może nie działać"
+    test_results+=("Port 80: WARNING (nie używany)")
   fi
   
-  if ! check_port 443 "HTTPS"; then
-    test_results+=("Porty 80/443: FAILED")
-    port_test_passed=false
-    log_warn "Port 443 jest zajęty - HTTPS może nie działać poprawnie"
+  if [[ -n "$port_443_status" ]]; then
+    if echo "$port_443_status" | grep -q "docker-proxy"; then
+      log_success "Port 443 jest używany przez Traefik (docker-proxy) - to jest OK!"
+      test_results+=("Port 443: OK (Traefik)")
+    elif echo "$port_443_status" | grep -q "server-"; then
+      log_success "Port 443 jest używany przez nasze usługi Safe-Spac - to jest OK!"
+      test_results+=("Port 443: OK (Safe-Spac)")
+    else
+      test_results+=("Porty 80/443: FAILED")
+      port_test_passed=false
+      log_warn "Port 443 jest zajęty przez inne usługi - może powodować problemy"
+    fi
+  else
+    log_warn "Port 443 nie jest używany - HTTPS może nie działać"
+    test_results+=("Port 443: WARNING (nie używany)")
   fi
   
   if [[ "$port_test_passed" == "true" ]]; then
@@ -1301,8 +1351,30 @@ start_services() {
   
   # Check ports one more time before starting
   log_info "Ostatnie sprawdzenie portów przed uruchomieniem:"
-  check_port 80 "HTTP" || log_warn "Port 80 może powodować problemy"
-  check_port 443 "HTTPS" || log_warn "Port 443 może powodować problemy"
+  
+  # Check if ports are already used by Traefik (which is OK)
+  local port_80_used=$(ss -tlnp 2>/dev/null | awk '/:80 / {print $0}' | head -1)
+  local port_443_used=$(ss -tlnp 2>/dev/null | awk '/:443 / {print $0}' | head -1)
+  
+  if [[ -n "$port_80_used" ]]; then
+    if echo "$port_80_used" | grep -q "docker-proxy"; then
+      log_success "Port 80 jest już używany przez Traefik - to jest OK!"
+    else
+      check_port 80 "HTTP" || log_warn "Port 80 może powodować problemy"
+    fi
+  else
+    log_info "Port 80 jest wolny"
+  fi
+  
+  if [[ -n "$port_443_used" ]]; then
+    if echo "$port_443_used" | grep -q "docker-proxy"; then
+      log_success "Port 443 jest już używany przez Traefik - to jest OK!"
+    else
+      check_port 443 "HTTPS" || log_warn "Port 443 może powodować problemy"
+    fi
+  else
+    log_info "Port 443 jest wolny"
+  fi
   
   if docker compose up -d; then
     log_success "Usługi Docker uruchomione"
