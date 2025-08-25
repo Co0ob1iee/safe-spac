@@ -71,7 +71,7 @@ self_dns_expect() {
 }
 
 self_wg_nat_ok() {
-  # sprawdź czy wg0 up i NAT reguły istnieją
+  # sprawdź czy wg0 up i NAT reguły istniejąsss
   ip link show wg0 >/dev/null 2>&1 || return 1
   ip link show wg0 | grep -q 'state UP' || true # nie zawsze UP od razu
   sysctl -n net.ipv4.ip_forward | grep -q '^1$' || return 1
@@ -122,7 +122,7 @@ banner
 
 # safe-spac installer (production-ready)
 # Usage (non-interactive):
-#   PUBLIC_IP=<IP> ./install.sh
+#   PUBLIC_IP=<IP> HAS_DOMAIN=Y DOMAIN=<domain> ACME_EMAIL=<email> ./install.sh
 # or interactive: script zapyta o domenę/IP, podsieć WG i prywatny sufiks DNS
 
 if [[ ${EUID} -ne 0 ]]; then
@@ -130,18 +130,45 @@ if [[ ${EUID} -ne 0 ]]; then
   exit 1
 fi
 
+# --- Zmienne środowiskowe (można nadpisać) ---
+HAS_DOMAIN=${HAS_DOMAIN:-}
+DOMAIN=${DOMAIN:-}
+ACME_EMAIL=${ACME_EMAIL:-}
+PUBLIC_IP=${PUBLIC_IP:-}
+
 # --- Interaktywne pytania ---
-read -r -p "Czy masz domenę dla serwera (y/N)? " HAS_DOMAIN || true
-HAS_DOMAIN=${HAS_DOMAIN:-N}
-DOMAIN=""
-ACME_EMAIL=""
+# Sprawdź czy HAS_DOMAIN jest już ustawione, jeśli nie - zapytaj
+if [[ -z "${HAS_DOMAIN:-}" ]]; then
+  read -r -p "Czy masz domenę dla serwera (y/N)? " HAS_DOMAIN || true
+  HAS_DOMAIN=${HAS_DOMAIN:-N}
+fi
+
 if [[ ${HAS_DOMAIN} =~ ^[Yy]$ ]]; then
-  read -r -p "Podaj domenę publiczną (np. safe.example.com): " DOMAIN
-  read -r -p "E-mail do Let's Encrypt (akceptujesz TOS): " ACME_EMAIL
+  if [[ -z "${DOMAIN:-}" ]]; then
+    read -r -p "Podaj domenę publiczną (np. safe.example.com): " DOMAIN
+  fi
+  if [[ -z "${ACME_EMAIL:-}" ]]; then
+    read -r -p "E-mail do Let's Encrypt (akceptujesz TOS): " ACME_EMAIL
+  fi
+  
+  # Walidacja wymaganych pól dla domeny
+  if [[ -z "${DOMAIN:-}" ]]; then
+    error "Domena jest wymagana gdy HAS_DOMAIN=Y"
+    exit 1
+  fi
+  if [[ -z "${ACME_EMAIL:-}" ]]; then
+    error "E-mail do Let's Encrypt jest wymagany gdy HAS_DOMAIN=Y"
+    exit 1
+  fi
 else
-  PUBLIC_IP=${PUBLIC_IP:-}
-  if [[ -z "${PUBLIC_IP}" ]]; then
+  if [[ -z "${PUBLIC_IP:-}" ]]; then
     read -r -p "Podaj publiczne IP serwera: " PUBLIC_IP
+  fi
+  
+  # Walidacja wymaganego pola dla IP
+  if [[ -z "${PUBLIC_IP:-}" ]]; then
+    error "Publiczne IP jest wymagane gdy nie ma domeny"
+    exit 1
   fi
 fi
 
