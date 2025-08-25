@@ -646,15 +646,23 @@ download_from_github() {
   cd server
   
   # Try to download docker-compose.yml.tmpl, but create fallback if it fails
+  log_info "Próbuję pobrać docker-compose.yml.tmpl z GitHub..."
   if curl -fsSL https://raw.githubusercontent.com/Co0ob1iee/safe-spac/main/server/docker-compose.yml.tmpl -o docker-compose.yml.tmpl; then
     log_info "Pobrano docker-compose.yml.tmpl"
+    
     # Verify the file is not empty and contains valid content
-    if [[ ! -s docker-compose.yml.tmpl ]] || ! grep -q "services:" docker-compose.yml.tmpl; then
-      log_warn "Pobrany docker-compose.yml.tmpl jest niepoprawny - tworzę podstawowy plik"
+    if [[ ! -s docker-compose.yml.tmpl ]]; then
+      log_warn "Pobrany docker-compose.yml.tmpl jest pusty - tworzę podstawowy plik"
       create_basic_docker_compose
+    elif ! grep -q "services:" docker-compose.yml.tmpl; then
+      log_warn "Pobrany docker-compose.yml.tmpl nie zawiera sekcji 'services' - tworzę podstawowy plik"
+      create_basic_docker_compose
+    else
+      log_success "docker-compose.yml.tmpl jest poprawny"
+      log_debug "Szablon ma $(wc -l < docker-compose.yml.tmpl) linii"
     fi
   else
-    log_warn "Nie można pobrać docker-compose.yml.tmpl - tworzę podstawowy plik"
+    log_warn "Nie można pobrać docker-compose.yml.tmpl z GitHub - tworzę podstawowy plik"
     create_basic_docker_compose
   fi
   
@@ -779,10 +787,17 @@ EOF
   log_success "Utworzono podstawowy docker-compose.yml"
   
   # Verify the file was created correctly
-  if [[ ! -f docker-compose.yml ]] || [[ ! -s docker-compose.yml ]]; then
+  if [[ ! -f docker-compose.yml ]]; then
     log_error "Nie udało się utworzyć docker-compose.yml"
     return 1
   fi
+  
+  if [[ ! -s docker-compose.yml ]]; then
+    log_error "Utworzony docker-compose.yml jest pusty"
+    return 1
+  fi
+  
+  log_debug "Utworzony docker-compose.yml ma $(wc -l < docker-compose.yml) linii"
   
   # Test if the file is valid YAML
   if command -v python3 >/dev/null 2>&1; then
@@ -792,6 +807,19 @@ EOF
       log_warn "docker-compose.yml może mieć błędy składni YAML"
     fi
   fi
+  
+  # Verify basic structure
+  if ! grep -q "services:" docker-compose.yml; then
+    log_error "Utworzony docker-compose.yml nie zawiera sekcji 'services'"
+    return 1
+  fi
+  
+  if ! grep -q "traefik:" docker-compose.yml; then
+    log_error "Utworzony docker-compose.yml nie zawiera usługi 'traefik'"
+    return 1
+  fi
+  
+  log_success "docker-compose.yml ma poprawną strukturę"
 }
 
 # Install system dependencies
@@ -1034,13 +1062,28 @@ configure_docker_services() {
   
   # Create docker-compose.yml from template or use existing one
   if [[ -f "docker-compose.yml.tmpl" ]]; then
+    log_info "Używam szablonu docker-compose.yml.tmpl"
+    
     # Use different delimiter for sed to avoid issues with slashes in IP addresses
-    sed \
+    if sed \
       -e "s|{{PUBLIC_IP}}|${PUBLIC_IP:-}|g" \
       -e "s|{{WG_SUBNET}}|${WG_SUBNET:-10.66.0.0/24}|g" \
       -e "s|{{ALLOWED_IPS}}|${ALLOWED_IPS:-10.66.0.0/24}|g" \
-      "docker-compose.yml.tmpl" > docker-compose.yml
-    log_success "Utworzono docker-compose.yml z szablonu"
+      "docker-compose.yml.tmpl" > docker-compose.yml; then
+      
+      log_success "Utworzono docker-compose.yml z szablonu"
+      
+      # Verify the created file
+      if [[ ! -s docker-compose.yml ]]; then
+        log_error "Utworzony docker-compose.yml jest pusty"
+        return 1
+      fi
+      
+      log_debug "Utworzony docker-compose.yml ma $(wc -l < docker-compose.yml) linii"
+    else
+      log_error "Nie udało się utworzyć docker-compose.yml z szablonu"
+      return 1
+    fi
   elif [[ -f "docker-compose.yml" ]]; then
     log_success "Używam istniejącego docker-compose.yml"
   else
@@ -1096,15 +1139,38 @@ start_services() {
   
   # Validate docker-compose.yml first
   log_info "Waliduję docker-compose.yml"
-  log_debug "Zawartość docker-compose.yml:"
+  
+  # Check if file exists and has content
+  if [[ ! -f docker-compose.yml ]]; then
+    log_error "Plik docker-compose.yml nie istnieje"
+    return 1
+  fi
+  
+  if [[ ! -s docker-compose.yml ]]; then
+    log_error "Plik docker-compose.yml jest pusty"
+    return 1
+  fi
+  
+  log_debug "Zawartość docker-compose.yml (pierwsze 20 linii):"
   cat docker-compose.yml | head -20 || true
   
+  log_debug "Rozmiar pliku: $(wc -l < docker-compose.yml) linii"
+  
+  # Try to validate with docker compose config
+  log_info "Sprawdzam składnię docker-compose.yml..."
   if ! docker compose config >/dev/null 2>&1; then
     log_error "docker-compose.yml ma błędy składni"
     log_info "Pełna zawartość pliku:"
     cat docker-compose.yml || true
+    
+    # Try to get more specific error information
+    log_info "Szczegółowy błąd walidacji:"
+    docker compose config 2>&1 | head -10 || true
+    
     return 1
   fi
+  
+  log_success "docker-compose.yml jest poprawny"
   
   # Start services
   log_info "Uruchamiam stack Docker Compose"
