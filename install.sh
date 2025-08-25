@@ -416,8 +416,12 @@ if [[ "$NEED_MINIMAL_CFG" == "1" ]]; then
   # URL Authelii musi być HTTPS
   if [[ -n "$DOMAIN" ]]; then
     AUTHELIA_URL="https://$DOMAIN"
+    # Dla domeny publicznej, używaj domeny jako cookie domain
+    COOKIE_DOMAIN="$DOMAIN"
   else
     AUTHELIA_URL="https://portal.${PRIVATE_SUFFIX}"
+    # Dla VPN, używaj prywatnego sufixu
+    COOKIE_DOMAIN="${PRIVATE_SUFFIX}"
   fi
   if [[ "$OIDC_ENABLE" == "1" ]]; then
     info "Włączono OIDC: generuję klucz RSA i konfigurację klientów"
@@ -471,14 +475,14 @@ notifier:
 access_control:
   default_policy: one_factor
   rules:
-    - domain: ['portal.safe.lan']
+    - domain: ['portal.__COOKIE_DOMAIN__']
       policy: one_factor
 
 session:
   secret: REPLACE_SESSION_SECRET
   cookies:
     - name: authelia_session
-      domain: safe.lan
+      domain: __COOKIE_DOMAIN__
       authelia_url: __AUTHELIA_URL__
       same_site: lax
       expiration: 1h
@@ -514,14 +518,14 @@ notifier:
 access_control:
   default_policy: one_factor
   rules:
-    - domain: ['portal.safe.lan']
+    - domain: ['portal.__COOKIE_DOMAIN__']
       policy: one_factor
 
 session:
   secret: REPLACE_SESSION_SECRET
   cookies:
     - name: authelia_session
-      domain: safe.lan
+      domain: __COOKIE_DOMAIN__
       authelia_url: __AUTHELIA_URL__
       same_site: lax
       expiration: 1h
@@ -571,6 +575,7 @@ YAML
   sed -i "s|REPLACE_STORAGE_KEY|${STOR_KEY//|/\|}|" "$AUTHELIA_DIR/configuration.yml"
   sed -i "s|REPLACE_SESSION_SECRET|${SESS_SECRET//|/\|}|" "$AUTHELIA_DIR/configuration.yml"
   sed -i "s|__AUTHELIA_URL__|${AUTHELIA_URL//|/\|}|" "$AUTHELIA_DIR/configuration.yml"
+  sed -i "s|__COOKIE_DOMAIN__|${COOKIE_DOMAIN//|/\|}|" "$AUTHELIA_DIR/configuration.yml"
   sed -i "s|REPLACE_RESET_JWT|${RESET_JWT//|/\|}|" "$AUTHELIA_DIR/configuration.yml"
   success "Zapisano minimalny Authelia configuration.yml"
   # Walidacja konfiguracji zanim odpalimy stack
