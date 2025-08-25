@@ -24,7 +24,7 @@ curl -fsSL https://raw.githubusercontent.com/Co0ob1iee/safe-spac/main/quick-inst
 - With domain (HTTPS + Let’s Encrypt):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Co0ob1iee/safe-spac/main/quick-install.sh | sudo HAS_DOMAIN=Y bash
+curl -fsSL https://raw.githubusercontent.com/Co0ob1iee/safe-spac/main/quick-install.sh | sudo HAS_DOMAIN=Y DOMAIN=your-domain.com ACME_EMAIL=your-email@example.com bash
 ```
 
 - Non‑interactive example (force IP + full‑tunnel):
@@ -35,6 +35,9 @@ curl -fsSL https://raw.githubusercontent.com/Co0ob1iee/safe-spac/main/quick-inst
 ```
 
 Supported environment variables:
+- `HAS_DOMAIN=Y|N` – whether server has a domain (for non‑interactive runs)
+- `DOMAIN` – public domain name (required when HAS_DOMAIN=Y)
+- `ACME_EMAIL` – email for Let's Encrypt (required when HAS_DOMAIN=Y)
 - `PUBLIC_IP` – server IP (when no domain or for non‑interactive runs)
 - `FULL_TUNNEL=Y|N` – enable NAT and AllowedIPs=0.0.0.0/0
 - `WG_SUBNET`, `WG_ADDR`, `PRIVATE_SUFFIX` – override defaults

@@ -71,7 +71,7 @@ self_dns_expect() {
 }
 
 self_wg_nat_ok() {
-  # sprawdź czy wg0 up i NAT reguły istniejąsss
+  # sprawdź czy wg0 up i NAT reguły istnieją
   ip link show wg0 >/dev/null 2>&1 || return 1
   ip link show wg0 | grep -q 'state UP' || true # nie zawsze UP od razu
   sysctl -n net.ipv4.ip_forward | grep -q '^1$' || return 1
@@ -271,9 +271,13 @@ systemctl enable wg-quick@wg0 || true
 systemctl restart wg-quick@wg0 || systemctl start wg-quick@wg0
 
 # Dodaj peera admina (10.66.0.2/32) i utrwal konfigurację
-admin_pub=$(tr -d '\n' </etc/wireguard/admin.pub)
-wg set wg0 peer "$admin_pub" allowed-ips 10.66.0.2/32 || true
-wg-quick save wg0 || true
+admin_pub=$(tr -d '\n' </etc/wireguard/admin.pub 2>/dev/null || true)
+if [[ -n "$admin_pub" ]]; then
+  wg set wg0 peer "$admin_pub" allowed-ips 10.66.0.2/32 || true
+  wg-quick save wg0 || true
+else
+  warn "Nie można odczytać klucza publicznego admina"
+fi
 
 # --- Konfiguracja resolvera systemowego na 10.66.0.1 (opcjonalnie) ---
 configure_resolver() {
@@ -298,14 +302,18 @@ RCF
 if [[ -z "${SET_RESOLVER:-}" ]]; then
   read -r -p "Ustawić systemowy resolver DNS na 10.66.0.1? (y/N): " SET_RESOLVER || true
 fi
-case "${SET_RESOLVER}" in
-  1|Y|y|yes|YES)
-    configure_resolver || true
-    ;;
-  *)
-    info "Pominięto zmianę resolvera (SET_RESOLVER nieaktywny)"
-    ;;
-esac
+
+# Normalizuj SET_RESOLVER do standardowych wartości i waliduj
+SET_RESOLVER=${SET_RESOLVER:-N}
+# Debug: wyświetl wartość zmiennej
+echo "DEBUG: SET_RESOLVER='${SET_RESOLVER}'" >&2
+
+# Sprawdź czy zmienna zawiera tylko dozwolone znaki
+if [[ ! "${SET_RESOLVER}" =~ ^[1Yy]es?$ ]]; then
+  info "Pominięto zmianę resolvera (SET_RESOLVER nieaktywny)"
+else
+  configure_resolver || true
+fi
 
 # --- NAT / full-tunnel (opcjonalnie) ---
 if [[ -z "$FULL_TUNNEL" ]]; then
@@ -373,7 +381,7 @@ step "Konfiguruję Authelię (użytkownik + minimalny configuration.yml)"
 # 1) Użytkownik admin
 if [[ ! -f "$AUTHELIA_DIR/users_database.yml" ]]; then
   ADMIN_PASS=$(openssl rand -base64 18)
-  run_with_spinner "Pull authelia:4.38 (if needed)" bash -lc "docker image inspect authelia/authelia:4.38 >/dev/null 2>&1 || docker pull authelia/authelia:4.38"
+  run_with_spinner "Pull authelia:4.38 (if needed)" sh -c "docker image inspect authelia/authelia:4.38 >/dev/null 2>&1 || docker pull authelia/authelia:4.38"
   HASH=$(docker run --rm authelia/authelia:4.38 authelia crypto hash generate argon2 --password "$ADMIN_PASS" | tail -1 | sed 's/^.*: //')
   cat > "$AUTHELIA_DIR/users_database.yml" <<YML
 users:
@@ -617,7 +625,7 @@ fi
 docker compose up -d
 
 # Restart samego dnsmasq jeśli już był
-(docker compose restart dnsmasq || true)
+docker compose restart dnsmasq || true
 
 # Autostart cron @reboot
 bash "$INSTALL_ROOT/scripts/install_cron.sh" || true
