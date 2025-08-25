@@ -653,9 +653,12 @@ download_from_github() {
   # Download other needed files
   for dir in authelia core-api teamspeak webapp wg-provisioner; do
     mkdir -p "$dir"
+    log_debug "Tworzę Dockerfile dla katalogu: $dir"
+    
     # Create simple Dockerfile for each directory instead of downloading complex ones
     case "$dir" in
       "webapp")
+        log_debug "Tworzę Dockerfile dla webapp"
         cat > "$dir/Dockerfile" <<EOF
 FROM nginx:alpine
 RUN apk add --no-cache curl
@@ -676,8 +679,10 @@ http {
     }
 }
 EOF
+        log_debug "Utworzono nginx.conf dla webapp"
         ;;
       "core-api")
+        log_debug "Tworzę Dockerfile dla core-api"
         cat > "$dir/Dockerfile" <<EOF
 FROM alpine:latest
 RUN apk add --no-cache curl
@@ -686,6 +691,7 @@ CMD ["sh", "-c", "echo 'Safe-Spac Core-API - Service Ready' && sleep infinity"]
 EOF
         ;;
       "wg-provisioner")
+        log_debug "Tworzę Dockerfile dla wg-provisioner"
         cat > "$dir/Dockerfile" <<EOF
 FROM alpine:latest
 RUN apk add --no-cache curl
@@ -695,13 +701,22 @@ EOF
         ;;
       *)
         # For other directories, create minimal Dockerfile
+        log_debug "Tworzę minimalny Dockerfile dla $dir"
         cat > "$dir/Dockerfile" <<EOF
 FROM alpine:latest
 CMD ["echo", "Service $dir placeholder"]
 EOF
         ;;
     esac
-    log_success "Utworzono Dockerfile dla $dir"
+    
+    # Verify the Dockerfile was created
+    if [[ -f "$dir/Dockerfile" ]]; then
+      log_success "Utworzono Dockerfile dla $dir ($(wc -l < "$dir/Dockerfile") linii)"
+      log_debug "Zawartość $dir/Dockerfile:"
+      cat "$dir/Dockerfile" | head -5
+    else
+      log_error "Nie udało się utworzyć Dockerfile dla $dir"
+    fi
   done
   
   cd ..
@@ -1181,6 +1196,17 @@ start_services() {
   # Show what we're about to build
   log_info "Usługi do zbudowania:"
   docker compose config --services 2>/dev/null || log_warn "Nie można wyświetlić listy usług"
+  
+  # Check what Dockerfiles are being used
+  log_info "Sprawdzam Dockerfile dla każdej usługi:"
+  for service in webapp core-api wg-provisioner; do
+    if [[ -d "$service" ]] && [[ -f "$service/Dockerfile" ]]; then
+      log_debug "Dockerfile dla $service ($(wc -l < "$service/Dockerfile") linii):"
+      cat "$service/Dockerfile" | head -3
+    else
+      log_warn "Brak Dockerfile dla $service"
+    fi
+  done
   
   # Try to build first to catch build errors early
   log_info "Buduję obrazy Docker..."
