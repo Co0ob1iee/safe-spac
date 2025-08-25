@@ -646,7 +646,14 @@ download_from_github() {
   cd server
   
   # Try to download docker-compose.yml.tmpl, but create fallback if it fails
-  if ! curl -fsSL https://raw.githubusercontent.com/Co0ob1iee/safe-spac/main/server/docker-compose.yml.tmpl -o docker-compose.yml.tmpl; then
+  if curl -fsSL https://raw.githubusercontent.com/Co0ob1iee/safe-spac/main/server/docker-compose.yml.tmpl -o docker-compose.yml.tmpl; then
+    log_info "Pobrano docker-compose.yml.tmpl"
+    # Verify the file is not empty and contains valid content
+    if [[ ! -s docker-compose.yml.tmpl ]] || ! grep -q "services:" docker-compose.yml.tmpl; then
+      log_warn "Pobrany docker-compose.yml.tmpl jest niepoprawny - tworzę podstawowy plik"
+      create_basic_docker_compose
+    fi
+  else
     log_warn "Nie można pobrać docker-compose.yml.tmpl - tworzę podstawowy plik"
     create_basic_docker_compose
   fi
@@ -770,6 +777,21 @@ volumes:
 EOF
 
   log_success "Utworzono podstawowy docker-compose.yml"
+  
+  # Verify the file was created correctly
+  if [[ ! -f docker-compose.yml ]] || [[ ! -s docker-compose.yml ]]; then
+    log_error "Nie udało się utworzyć docker-compose.yml"
+    return 1
+  fi
+  
+  # Test if the file is valid YAML
+  if command -v python3 >/dev/null 2>&1; then
+    if python3 -c "import yaml; yaml.safe_load(open('docker-compose.yml'))" 2>/dev/null; then
+      log_success "docker-compose.yml jest poprawnym plikiem YAML"
+    else
+      log_warn "docker-compose.yml może mieć błędy składni YAML"
+    fi
+  fi
 }
 
 # Install system dependencies
@@ -1012,10 +1034,11 @@ configure_docker_services() {
   
   # Create docker-compose.yml from template or use existing one
   if [[ -f "docker-compose.yml.tmpl" ]]; then
+    # Use different delimiter for sed to avoid issues with slashes in IP addresses
     sed \
-      -e "s/{{PUBLIC_IP}}/${PUBLIC_IP:-}/g" \
-      -e "s/{{WG_SUBNET}}/${WG_SUBNET//\//\\/}/g" \
-      -e "s/{{ALLOWED_IPS}}/${ALLOWED_IPS:-10.66.0.0/24}/g" \
+      -e "s|{{PUBLIC_IP}}|${PUBLIC_IP:-}|g" \
+      -e "s|{{WG_SUBNET}}|${WG_SUBNET:-10.66.0.0/24}|g" \
+      -e "s|{{ALLOWED_IPS}}|${ALLOWED_IPS:-10.66.0.0/24}|g" \
       "docker-compose.yml.tmpl" > docker-compose.yml
     log_success "Utworzono docker-compose.yml z szablonu"
   elif [[ -f "docker-compose.yml" ]]; then
@@ -1073,9 +1096,12 @@ start_services() {
   
   # Validate docker-compose.yml first
   log_info "Waliduję docker-compose.yml"
+  log_debug "Zawartość docker-compose.yml:"
+  cat docker-compose.yml | head -20 || true
+  
   if ! docker compose config >/dev/null 2>&1; then
     log_error "docker-compose.yml ma błędy składni"
-    log_info "Zawartość pliku:"
+    log_info "Pełna zawartość pliku:"
     cat docker-compose.yml || true
     return 1
   fi
