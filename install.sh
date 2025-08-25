@@ -645,26 +645,10 @@ download_from_github() {
   mkdir -p server
   cd server
   
-  # Try to download docker-compose.yml.tmpl, but create fallback if it fails
-  log_info "Próbuję pobrać docker-compose.yml.tmpl z GitHub..."
-  if curl -fsSL https://raw.githubusercontent.com/Co0ob1iee/safe-spac/main/server/docker-compose.yml.tmpl -o docker-compose.yml.tmpl; then
-    log_info "Pobrano docker-compose.yml.tmpl"
-    
-    # Verify the file is not empty and contains valid content
-    if [[ ! -s docker-compose.yml.tmpl ]]; then
-      log_warn "Pobrany docker-compose.yml.tmpl jest pusty - tworzę podstawowy plik"
-      create_basic_docker_compose
-    elif ! grep -q "services:" docker-compose.yml.tmpl; then
-      log_warn "Pobrany docker-compose.yml.tmpl nie zawiera sekcji 'services' - tworzę podstawowy plik"
-      create_basic_docker_compose
-    else
-      log_success "docker-compose.yml.tmpl jest poprawny"
-      log_debug "Szablon ma $(wc -l < docker-compose.yml.tmpl) linii"
-    fi
-  else
-    log_warn "Nie można pobrać docker-compose.yml.tmpl z GitHub - tworzę podstawowy plik"
-    create_basic_docker_compose
-  fi
+  # Always create basic docker-compose.yml instead of using template
+  # This ensures we have working services without complex dependencies
+  log_info "Tworzę podstawowy docker-compose.yml z prostymi usługami"
+  create_basic_docker_compose
   
   # Download other needed files
   for dir in authelia core-api teamspeak webapp wg-provisioner; do
@@ -1101,34 +1085,12 @@ configure_docker_services() {
   
   pushd "$INSTALL_ROOT/server" >/dev/null
   
-  # Create docker-compose.yml from template or use existing one
-  if [[ -f "docker-compose.yml.tmpl" ]]; then
-    log_info "Używam szablonu docker-compose.yml.tmpl"
-    
-    # Use different delimiter for sed to avoid issues with slashes in IP addresses
-    if sed \
-      -e "s|{{PUBLIC_IP}}|${PUBLIC_IP:-}|g" \
-      -e "s|{{WG_SUBNET}}|${WG_SUBNET:-10.66.0.0/24}|g" \
-      -e "s|{{ALLOWED_IPS}}|${ALLOWED_IPS:-10.66.0.0/24}|g" \
-      "docker-compose.yml.tmpl" > docker-compose.yml; then
-      
-      log_success "Utworzono docker-compose.yml z szablonu"
-      
-      # Verify the created file
-      if [[ ! -s docker-compose.yml ]]; then
-        log_error "Utworzony docker-compose.yml jest pusty"
-        return 1
-      fi
-      
-      log_debug "Utworzony docker-compose.yml ma $(wc -l < docker-compose.yml) linii"
-    else
-      log_error "Nie udało się utworzyć docker-compose.yml z szablonu"
-      return 1
-    fi
-  elif [[ -f "docker-compose.yml" ]]; then
+  # Use existing docker-compose.yml (created by download_from_github)
+  if [[ -f "docker-compose.yml" ]]; then
     log_success "Używam istniejącego docker-compose.yml"
+    log_debug "Plik ma $(wc -l < docker-compose.yml) linii"
   else
-    log_error "Brak pliku docker-compose.yml ani szablonu"
+    log_error "Brak pliku docker-compose.yml"
     return 1
   fi
   
@@ -1222,12 +1184,22 @@ start_services() {
   
   # Try to build first to catch build errors early
   log_info "Buduję obrazy Docker..."
-  if docker compose build --no-cache 2>&1 | tee /tmp/docker-build.log; then
+  
+  # Show what we're building
+  log_info "Usługi do zbudowania:"
+  docker compose config --services 2>/dev/null || log_warn "Nie można wyświetlić listy usług"
+  
+  # Build with more verbose output
+  if docker compose build --no-cache --progress=plain 2>&1 | tee /tmp/docker-build.log; then
     log_success "Obrazy Docker zbudowane pomyślnie"
   else
-    log_warn "Wystąpiły błędy podczas budowania (może być normalne dla pierwszego uruchomienia)"
-    log_info "Log budowania:"
-    tail -20 /tmp/docker-build.log 2>/dev/null || true
+    log_warn "Wystąpiły błędy podczas budowania"
+    log_info "Ostatnie linie logu budowania:"
+    tail -30 /tmp/docker-build.log 2>/dev/null || true
+    
+    # Try to show specific build errors
+    log_info "Szczegółowe błędy budowania:"
+    grep -i "error\|failed" /tmp/docker-build.log | tail -10 2>/dev/null || true
   fi
   
   # Now try to start services
