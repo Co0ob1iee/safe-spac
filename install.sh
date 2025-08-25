@@ -12,8 +12,9 @@ declare -a INSTALLATION_ERRORS=()
 declare -a DEBUG_LOG=()
 
 # Configuration
-SCRIPT_DIR="$(cd -- "$(dirname "$0")" >/dev/null 2>&1 && pwd -P)"
-SCRIPT_NAME="$(basename "$0")"
+# When using curl | bash, these variables may not be available
+SCRIPT_DIR="${SCRIPT_DIR:-/tmp}"
+SCRIPT_NAME="${SCRIPT_NAME:-install.sh}"
 START_TIME=$(date +%s)
 
 # Enhanced color system
@@ -78,21 +79,14 @@ log_banner() {
 }
 
 # Enhanced error handling
-trap 'handle_exit $? $LINENO $BASH_LINENO "$BASH_COMMAND" $(printf "::%s" ${FUNCNAME[@]:-})' EXIT
+trap 'handle_exit $? $LINENO' EXIT
 
 handle_exit() {
   local exit_code=$1
   local line_no=$2
-  local bash_lineno=$3
-  local last_command="$4"
-  local func_stack="$5"
   
   if [[ $exit_code -ne 0 ]]; then
     log_error "Skrypt zakończył się błędem (kod: $exit_code) w linii $line_no"
-    log_error "Ostatnia komenda: $last_command"
-    if [[ -n "$func_stack" ]]; then
-      log_error "Stack funkcji: $func_stack"
-    fi
   fi
   
   # Show final summary
@@ -593,12 +587,10 @@ main_installation() {
   
   # Copy files or download from GitHub
   track_progress "Kopiowanie plików" "Kopiuję lub pobieram pliki instalacyjne"
-  if [[ ! -f "$SCRIPT_DIR/install.sh" ]] || [[ ! -d "$SCRIPT_DIR/server" ]]; then
-    log_warn "SCRIPT_DIR ($SCRIPT_DIR) nie zawiera plików safe-spac - używam fallback"
-    download_from_github || return 1
-  else
-    safe_copy_files "$SCRIPT_DIR" "$INSTALL_ROOT" "pliki safe-spac" || return 1
-  fi
+  
+  # When using curl | bash, always use fallback
+  log_info "Używam fallback - pobieram pliki z GitHub"
+  download_from_github || return 1
   
   # Configure network
   track_progress "Konfiguracja sieci" "Konfiguruję IP forwarding i reguły NAT"
@@ -1086,6 +1078,5 @@ EOF
 }
 
 # Main execution
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-  main_installation "$@"
-fi
+# Always run when script is executed (works with both direct execution and curl | bash)
+main_installation "$@"
