@@ -230,7 +230,32 @@ fi
 
 # --- Skopiowanie repo do /opt ---
 mkdir -p "$INSTALL_ROOT"
-rsync -a --delete --exclude .git --exclude build --exclude node_modules "$SCRIPT_DIR"/ "$INSTALL_ROOT"/
+
+# Debug: sprawdź ścieżki (tylko w przypadku problemów)
+if [[ "${DEBUG_INSTALL:-}" == "1" ]]; then
+  echo "DEBUG: SCRIPT_DIR='$SCRIPT_DIR'" >&2
+  echo "DEBUG: INSTALL_ROOT='$INSTALL_ROOT'" >&2
+  ls -la "$SCRIPT_DIR" || echo "DEBUG: Nie można wyświetlić SCRIPT_DIR" >&2
+fi
+
+# Sprawdź czy rsync jest dostępny
+if ! command -v rsync >/dev/null 2>&1; then
+  error "rsync nie jest dostępny - używam cp jako fallback"
+  cp -r "$SCRIPT_DIR"/* "$INSTALL_ROOT/" 2>/dev/null || {
+    error "Nie można skopiować plików z $SCRIPT_DIR do $INSTALL_ROOT"
+    exit 1
+  }
+else
+  rsync -a --delete --exclude .git --exclude build --exclude node_modules "$SCRIPT_DIR"/ "$INSTALL_ROOT/"
+fi
+
+# Sprawdź czy katalog server został skopiowany
+if [[ ! -d "$INSTALL_ROOT/server" ]]; then
+  error "Katalog server nie został skopiowany. Sprawdzam zawartość INSTALL_ROOT:"
+  ls -la "$INSTALL_ROOT/" || true
+  error "Instalacja nie powiodła się - problem z kopiowaniem plików"
+  exit 1
+fi
 
 # --- Kolizja portu 80 (hostowy nginx) ---
 if systemctl list-unit-files | grep -q '^nginx\.service'; then
@@ -587,6 +612,14 @@ else
 fi
 
 # --- Render docker-compose.yml ---
+# Sprawdź czy katalog server istnieje
+if [[ ! -d "$INSTALL_ROOT/server" ]]; then
+  error "Katalog $INSTALL_ROOT/server nie istnieje. Sprawdzam strukturę..."
+  ls -la "$INSTALL_ROOT/" || true
+  error "Instalacja nie powiodła się - brak katalogu server"
+  exit 1
+fi
+
 pushd "$INSTALL_ROOT/server" >/dev/null
 sed \
   -e "s/{{PUBLIC_IP}}/${PUBLIC_IP:-}/g" \
