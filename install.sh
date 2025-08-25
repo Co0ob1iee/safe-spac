@@ -303,10 +303,8 @@ if [[ -z "${SET_RESOLVER:-}" ]]; then
   read -r -p "Ustawić systemowy resolver DNS na 10.66.0.1? (y/N): " SET_RESOLVER || true
 fi
 
-# Normalizuj SET_RESOLVER do standardowych wartości i waliduj
+# Normalizuj SET_RESOLVER do standardowych wartości
 SET_RESOLVER=${SET_RESOLVER:-N}
-# Debug: wyświetl wartość zmiennej
-echo "DEBUG: SET_RESOLVER='${SET_RESOLVER}'" >&2
 
 # Sprawdź czy zmienna zawiera tylko dozwolone znaki
 if [[ ! "${SET_RESOLVER}" =~ ^[1Yy]es?$ ]]; then
