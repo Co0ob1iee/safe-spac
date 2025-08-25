@@ -133,21 +133,68 @@ check_port() {
     log_warn "Port $port jest zajęty przez $service_name"
     ss -tlnp | awk -v P=":${port}" '$4 ~ P {print "  -", $0}' || true
     
-    # Try to identify and stop conflicting service
+    # Try to identify and stop conflicting services
+    local stopped_services=()
+    
+    # Check for nginx
     if systemctl list-units --type=service --state=running | grep -q nginx; then
       log_info "Wykryto nginx - próbuję zatrzymać"
       if systemctl stop nginx 2>/dev/null; then
         log_success "Nginx zatrzymany"
+        stopped_services+=("nginx")
         if systemctl disable nginx 2>/dev/null; then
           log_success "Nginx wyłączony"
         fi
       fi
     fi
     
+    # Check for apache2
+    if systemctl list-units --type=service --state=running | grep -q apache2; then
+      log_info "Wykryto apache2 - próbuję zatrzymać"
+      if systemctl stop apache2 2>/dev/null; then
+        log_success "Apache2 zatrzymany"
+        stopped_services+=("apache2")
+        if systemctl disable apache2 2>/dev/null; then
+          log_success "Apache2 wyłączony"
+        fi
+      fi
+    fi
+    
+    # Check for lighttpd
+    if systemctl list-units --type=service --state=running | grep -q lighttpd; then
+      log_info "Wykryto lighttpd - próbuję zatrzymać"
+      if systemctl stop lighttpd 2>/dev/null; then
+        log_success "Lighttpd zatrzymany"
+        stopped_services+=("lighttpd")
+        if systemctl disable lighttpd 2>/dev/null; then
+          log_success "Lighttpd wyłączony"
+        fi
+      fi
+    fi
+    
+    # Check for other web servers
+    if systemctl list-units --type=service --state=running | grep -E "(httpd|webmin|caddy)"; then
+      log_info "Wykryto inne serwery HTTP - próbuję zatrzymać"
+      systemctl stop httpd webmin caddy 2>/dev/null || true
+      systemctl disable httpd webmin caddy 2>/dev/null || true
+      stopped_services+=("inne_serwery_http")
+    fi
+    
+    # Wait a moment for services to stop
+    if [[ ${#stopped_services[@]} -gt 0 ]]; then
+      log_info "Czekam 3 sekundy na zatrzymanie usług..."
+      sleep 3
+    fi
+    
     # Check again
     if ss -tlnp 2>/dev/null | awk -v P=":${port}" '$4 ~ P {print}' | grep -q ":${port} "; then
       log_warn "Port $port nadal zajęty po próbie zwolnienia"
+      log_info "Zatrzymane usługi: ${stopped_services[*]}"
+      log_info "Sprawdzam co jeszcze może blokować port:"
+      ss -tlnp | awk -v P=":${port}" '$4 ~ P {print "  -", $0}' || true
       return 1
+    else
+      log_success "Port $port zwolniony po zatrzymaniu usług: ${stopped_services[*]}"
     fi
   fi
   
@@ -254,10 +301,31 @@ run_self_tests() {
   fi
   
   # Test 2: Port availability
-  if check_port 80 "HTTP" && check_port 443 "HTTPS"; then
-    test_results+=("Porty 80/443: OK")
-  else
+  log_info "Testuję dostępność portów..."
+  local port_test_passed=true
+  
+  if ! check_port 80 "HTTP"; then
     test_results+=("Porty 80/443: FAILED")
+    port_test_passed=false
+    log_warn "Port 80 jest zajęty - Traefik może nie działać poprawnie"
+    
+    # Show what's using port 80
+    log_info "Co używa portu 80:"
+    ss -tlnp | grep ":80" || true
+    
+    # Show running web services
+    log_info "Uruchomione usługi web:"
+    systemctl list-units --type=service --state=running | grep -E "(nginx|apache|http|web)" || true
+  fi
+  
+  if ! check_port 443 "HTTPS"; then
+    test_results+=("Porty 80/443: FAILED")
+    port_test_passed=false
+    log_warn "Port 443 jest zajęty - HTTPS może nie działać poprawnie"
+  fi
+  
+  if [[ "$port_test_passed" == "true" ]]; then
+    test_results+=("Porty 80/443: OK")
   fi
   
   # Test 3: Authelia configuration
@@ -1229,12 +1297,37 @@ start_services() {
   fi
   
   # Now try to start services
+  log_info "Próbuję uruchomić usługi Docker..."
+  
+  # Check ports one more time before starting
+  log_info "Ostatnie sprawdzenie portów przed uruchomieniem:"
+  check_port 80 "HTTP" || log_warn "Port 80 może powodować problemy"
+  check_port 443 "HTTPS" || log_warn "Port 443 może powodować problemy"
+  
   if docker compose up -d; then
     log_success "Usługi Docker uruchomione"
+    
+    # Wait a moment and check if services are running
+    log_info "Sprawdzam status usług..."
+    sleep 5
+    docker compose ps
+    
+    # Check if Traefik is listening on ports
+    log_info "Sprawdzam czy Traefik nasłuchuje na portach:"
+    ss -tlnp | grep -E ":80|:443" || log_warn "Traefik może nie nasłuchiwać na portach 80/443"
+    
   else
     log_error "Nie udało się uruchomić usług Docker"
     log_info "Szczegóły błędu:"
     docker compose logs --tail=20 2>/dev/null || true
+    
+    # Try to get more specific error information
+    log_info "Status kontenerów:"
+    docker compose ps 2>/dev/null || true
+    
+    log_info "Szczegółowe logi ostatnich kontenerów:"
+    docker compose logs --tail=50 2>/dev/null || true
+    
     return 1
   fi
   
