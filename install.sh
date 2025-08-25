@@ -645,11 +645,11 @@ download_from_github() {
   mkdir -p server
   cd server
   
-  # Download docker-compose.yml.tmpl
-  curl -fsSL https://raw.githubusercontent.com/Co0ob1iee/safe-spac/main/server/docker-compose.yml.tmpl -o docker-compose.yml.tmpl || {
-    log_error "Nie można pobrać docker-compose.yml.tmpl"
-    return 1
-  }
+  # Try to download docker-compose.yml.tmpl, but create fallback if it fails
+  if ! curl -fsSL https://raw.githubusercontent.com/Co0ob1iee/safe-spac/main/server/docker-compose.yml.tmpl -o docker-compose.yml.tmpl; then
+    log_warn "Nie można pobrać docker-compose.yml.tmpl - tworzę podstawowy plik"
+    create_basic_docker_compose
+  fi
   
   # Download other needed files
   for dir in authelia core-api teamspeak webapp wg-provisioner; do
@@ -673,6 +673,103 @@ download_from_github() {
   
   log_success "Pobrano pliki safe-spac z GitHub"
   return 0
+}
+
+# Create basic docker-compose.yml if template is not available
+create_basic_docker_compose() {
+  log_info "Tworzę podstawowy docker-compose.yml"
+  
+  cat > docker-compose.yml <<EOF
+version: '3.8'
+
+services:
+  traefik:
+    image: traefik:v2.10
+    container_name: traefik
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik:/etc/traefik
+    command:
+      - --api.dashboard=true
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --certificatesresolvers.le.acme.tlschallenge=true
+      - --certificatesresolvers.le.acme.email=admin@example.com
+      - --certificatesresolvers.le.acme.storage=/etc/traefik/acme.json
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.traefik.rule=Host(\`traefik.localhost\`)
+      - traefik.http.routers.traefik.service=api@internal
+      - traefik.http.routers.traefik.entrypoints=web
+
+  dnsmasq:
+    image: alpine:latest
+    container_name: dnsmasq
+    restart: unless-stopped
+    ports:
+      - "53:53/udp"
+    volumes:
+      - ./dnsmasq:/etc/dnsmasq.d
+    command: ["sh", "-c", "echo 'nameserver 8.8.8.8' > /etc/resolv.conf && dnsmasq -d -C /etc/dnsmasq.d/dnsmasq.conf"]
+
+  authelia:
+    image: authelia/authelia:4.38
+    container_name: authelia
+    restart: unless-stopped
+    volumes:
+      - ../authelia:/config
+    ports:
+      - "9091:9091"
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.authelia.rule=Host(\`auth.localhost\`)
+      - traefik.http.routers.authelia.service=authelia
+      - traefik.http.routers.authelia.entrypoints=web
+      - traefik.http.services.authelia.loadbalancer.server.port=9091
+
+  webapp:
+    build: ./webapp
+    container_name: webapp
+    restart: unless-stopped
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.webapp.rule=Host(\`webapp.localhost\`)
+      - traefik.http.routers.webapp.service=webapp
+      - traefik.http.routers.webapp.entrypoints=web
+      - traefik.http.services.webapp.loadbalancer.server.port=3000
+
+  core-api:
+    build: ./core-api
+    container_name: core-api
+    restart: unless-stopped
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.coreapi.rule=Host(\`api.localhost\`)
+      - traefik.http.routers.coreapi.service=core-api
+      - traefik.http.routers.coreapi.entrypoints=web
+      - traefik.http.services.core-api.loadbalancer.server.port=8080
+
+  wg-provisioner:
+    build: ./wg-provisioner
+    container_name: wg-provisioner
+    restart: unless-stopped
+    volumes:
+      - /etc/wireguard:/etc/wireguard:ro
+    environment:
+      - WG_SUBNET=${WG_SUBNET:-10.66.0.0/24}
+      - WG_ADDR=${WG_ADDR:-10.66.0.1/24}
+
+volumes:
+  traefik-acme:
+EOF
+
+  log_success "Utworzono podstawowy docker-compose.yml"
 }
 
 # Install system dependencies
@@ -913,16 +1010,18 @@ configure_docker_services() {
   
   pushd "$INSTALL_ROOT/server" >/dev/null
   
-  # Create docker-compose.yml from template
+  # Create docker-compose.yml from template or use existing one
   if [[ -f "docker-compose.yml.tmpl" ]]; then
     sed \
       -e "s/{{PUBLIC_IP}}/${PUBLIC_IP:-}/g" \
       -e "s/{{WG_SUBNET}}/${WG_SUBNET//\//\\/}/g" \
       -e "s/{{ALLOWED_IPS}}/${ALLOWED_IPS:-10.66.0.0/24}/g" \
       "docker-compose.yml.tmpl" > docker-compose.yml
-    log_success "Utworzono docker-compose.yml"
+    log_success "Utworzono docker-compose.yml z szablonu"
+  elif [[ -f "docker-compose.yml" ]]; then
+    log_success "Używam istniejącego docker-compose.yml"
   else
-    log_error "Brak szablonu docker-compose.yml.tmpl"
+    log_error "Brak pliku docker-compose.yml ani szablonu"
     return 1
   fi
   
@@ -972,11 +1071,23 @@ start_services() {
   
   pushd "$INSTALL_ROOT/server" >/dev/null
   
+  # Validate docker-compose.yml first
+  log_info "Waliduję docker-compose.yml"
+  if ! docker compose config >/dev/null 2>&1; then
+    log_error "docker-compose.yml ma błędy składni"
+    log_info "Zawartość pliku:"
+    cat docker-compose.yml || true
+    return 1
+  fi
+  
   # Start services
+  log_info "Uruchamiam stack Docker Compose"
   if docker compose up -d; then
     log_success "Usługi Docker uruchomione"
   else
     log_error "Nie udało się uruchomić usług Docker"
+    log_info "Szczegóły błędu:"
+    docker compose logs --tail=20 2>/dev/null || true
     return 1
   fi
   
