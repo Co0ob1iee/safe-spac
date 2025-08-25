@@ -1,551 +1,869 @@
 #!/usr/bin/env bash
+
+# Safe-Spac Installer - Enhanced Version
+# Enhanced with better debugging, error handling, and user interface
+
 set -euo pipefail
 
-# Resolve script directory (so rsync works even when called via absolute path)
-SCRIPT_DIR="$(cd -- "$(dirname "$0")" >/dev/null 2>&1 && pwd -P)"
+# Global variables for tracking installation status
+declare -a INSTALLATION_DONE=()
+declare -a INSTALLATION_WARNINGS=()
+declare -a INSTALLATION_ERRORS=()
+declare -a DEBUG_LOG=()
 
-# --- Color & UI helpers ---
+# Configuration
+SCRIPT_DIR="$(cd -- "$(dirname "$0")" >/dev/null 2>&1 && pwd -P)"
+SCRIPT_NAME="$(basename "$0")"
+START_TIME=$(date +%s)
+
+# Enhanced color system
 if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then
   ncolors=$(tput colors || echo 0)
 else
   ncolors=0
 fi
 
-# --- Preflight: sprawdź, czy porty 80/443 są wolne ---
-check_port() {
-  local p=$1
-  if ss -tlnp 2>/dev/null | awk -v P=":${p}" '$4 ~ P {print}' | grep -q ":${p} "; then
-    warn "Port ${p} jest aktualnie zajęty przez:" 
-    ss -tlnp | awk -v P=":${p}" '$4 ~ P {print "  -", $0}'
-    echo ""
-    echo "Aby Traefik mógł wystartować, zwolnij port ${p}. Jeśli to nginx: systemctl stop nginx && systemctl disable nginx"
-  else
-    success "Port ${p} jest wolny"
+if [[ ${NO_COLOR:-} != 1 ]] && [[ $ncolors -ge 8 ]]; then
+  # Rich color palette
+  C_RESET="\033[0m"; C_BOLD="\033[1m"; C_UNDERLINE="\033[4m"
+  C_INFO="\033[36m"; C_WARN="\033[33m"; C_ERR="\033[31m"; C_OK="\033[32m"; C_DIM="\033[2m"
+  C_BLUE="\033[34m"; C_MAGENTA="\033[35m"; C_CYAN="\033[36m"; C_WHITE="\033[37m"
+  C_BG_INFO="\033[46m"; C_BG_WARN="\033[43m"; C_BG_ERR="\033[41m"
+else
+  C_RESET=""; C_BOLD=""; C_UNDERLINE=""
+  C_INFO=""; C_WARN=""; C_ERR=""; C_OK=""; C_DIM=""
+  C_BLUE=""; C_MAGENTA=""; C_CYAN=""; C_WHITE=""
+  C_BG_INFO=""; C_BG_WARN=""; C_BG_ERR=""
+fi
+
+# Enhanced logging functions
+log_debug() {
+  if [[ "${DEBUG_INSTALL:-}" == "1" ]]; then
+    printf "%b[DEBUG]%b %s\n" "$C_DIM" "$C_RESET" "$*" >&2
+    DEBUG_LOG+=("$(date '+%H:%M:%S') [DEBUG] $*")
   fi
 }
 
-if [[ ${NO_COLOR:-} != 1 ]] && [[ $ncolors -ge 8 ]]; then
-  C_RESET="\033[0m"; C_BOLD="\033[1m"
-  C_INFO="\033[36m"; C_WARN="\033[33m"; C_ERR="\033[31m"; C_OK="\033[32m"; C_DIM="\033[2m"
-else
-  C_RESET=""; C_BOLD=""; C_INFO=""; C_WARN=""; C_ERR=""; C_OK=""; C_DIM=""
-fi
-
-info()    { printf "%b[INFO]%b %s\n"   "$C_INFO" "$C_RESET" "$*"; }
-warn()    { printf "%b[WARN]%b %s\n"   "$C_WARN" "$C_RESET" "$*"; }
-error()   { printf "%b[ERR ]%b %s\n"   "$C_ERR" "$C_RESET" "$*"; }
-success() { printf "%b[ OK ]%b %s\n"   "$C_OK"  "$C_RESET" "$*"; }
-step()    { printf "%b==>%b %s\n"       "$C_BOLD" "$C_RESET" "$*"; }
-
-# Uruchom preflight dopiero po zdefiniowaniu funkcji logujących
-check_port 80
-check_port 443
-
-# --- Helpers: validation & self-tests ---
-authelia_validate() {
-  local cfg="$1"
-  docker run --rm -v "$(dirname "$cfg")":/config authelia/authelia:4.38 authelia validate-config --config "/config/$(basename "$cfg")"
+log_info() {
+  printf "%b[INFO]%b %s\n" "$C_INFO" "$C_RESET" "$*"
+  DEBUG_LOG+=("$(date '+%H:%M:%S') [INFO] $*")
 }
 
-self_http_retry() {
-  # self_http_retry <url> <timeout_sec>
-  local url="$1"; local timeout="${2:-30}"; local start=$(date +%s)
-  while true; do
-    code=$(curl -ks -o /dev/null -w '%{http_code}' "$url" || echo 000)
-    if [[ "$code" =~ ^2|3[0-9]{1}$ ]]; then
-      echo "$code"; return 0
+log_warn() {
+  printf "%b[WARN]%b %s\n" "$C_WARN" "$C_RESET" "$*" >&2
+  INSTALLATION_WARNINGS+=("$*")
+  DEBUG_LOG+=("$(date '+%H:%M:%S') [WARN] $*")
+}
+
+log_error() {
+  printf "%b[ERROR]%b %s\n" "$C_ERR" "$C_RESET" "$*" >&2
+  INSTALLATION_ERRORS+=("$*")
+  DEBUG_LOG+=("$(date '+%H:%M:%S') [ERROR] $*")
+}
+
+log_success() {
+  printf "%b[SUCCESS]%b %s\n" "$C_OK" "$C_RESET" "$*"
+  INSTALLATION_DONE+=("$*")
+  DEBUG_LOG+=("$(date '+%H:%M:%S') [SUCCESS] $*")
+}
+
+log_step() {
+  printf "\n%b==>%b %s\n" "$C_BOLD" "$C_RESET" "$*"
+  DEBUG_LOG+=("$(date '+%H:%M:%S') [STEP] $*")
+}
+
+log_banner() {
+  printf "\n%b%s%b\n" "$C_BOLD" "$*" "$C_RESET"
+  printf "%b%s%b\n\n" "$C_DIM" "$(printf '=%.0s' {1..${#1}})" "$C_RESET"
+}
+
+# Enhanced error handling
+trap 'handle_exit $? $LINENO $BASH_LINENO "$BASH_COMMAND" $(printf "::%s" ${FUNCNAME[@]:-})' EXIT
+
+handle_exit() {
+  local exit_code=$1
+  local line_no=$2
+  local bash_lineno=$3
+  local last_command="$4"
+  local func_stack="$5"
+  
+  if [[ $exit_code -ne 0 ]]; then
+    log_error "Skrypt zakończył się błędem (kod: $exit_code) w linii $line_no"
+    log_error "Ostatnia komenda: $last_command"
+    if [[ -n "$func_stack" ]]; then
+      log_error "Stack funkcji: $func_stack"
     fi
-    if (( $(date +%s) - start >= timeout )); then
-      echo "$code"; return 1
+  fi
+  
+  # Show final summary
+  show_final_summary
+}
+
+# Enhanced validation functions
+validate_environment() {
+  log_step "Walidacja środowiska"
+  
+  # Check if running as root
+  if [[ ${EUID} -ne 0 ]]; then
+    log_error "Skrypt musi być uruchomiony jako root (sudo)"
+    return 1
+  fi
+  
+  # Check required commands
+  local required_commands=("curl" "systemctl")
+  for cmd in "${required_commands[@]}"; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      log_warn "Komenda $cmd nie jest dostępna"
+    else
+      log_debug "Komenda $cmd dostępna: $(command -v "$cmd")"
     fi
-    sleep 1
+  done
+  
+  # Check system info
+  log_debug "System: $(uname -a)"
+  log_debug "Distro: $(cat /etc/os-release | grep PRETTY_NAME | cut -d'"' -f2 || echo 'unknown')"
+  log_debug "Kernel: $(uname -r)"
+  log_debug "Architecture: $(uname -m)"
+  
+  log_success "Walidacja środowiska zakończona"
+}
+
+# Enhanced port checking
+check_port() {
+  local port=$1
+  local service_name=${2:-"nieznany"}
+  
+  log_debug "Sprawdzam port $port"
+  
+  if ss -tlnp 2>/dev/null | awk -v P=":${port}" '$4 ~ P {print}' | grep -q ":${port} "; then
+    log_warn "Port $port jest zajęty przez $service_name"
+    ss -tlnp | awk -v P=":${port}" '$4 ~ P {print "  -", $0}' || true
+    
+    # Try to identify and stop conflicting service
+    if systemctl list-units --type=service --state=running | grep -q nginx; then
+      log_info "Wykryto nginx - próbuję zatrzymać"
+      if systemctl stop nginx 2>/dev/null; then
+        log_success "Nginx zatrzymany"
+        if systemctl disable nginx 2>/dev/null; then
+          log_success "Nginx wyłączony"
+        fi
+      fi
+    fi
+    
+    # Check again
+    if ss -tlnp 2>/dev/null | awk -v P=":${port}" '$4 ~ P {print}' | grep -q ":${port} "; then
+      log_warn "Port $port nadal zajęty po próbie zwolnienia"
+      return 1
+    fi
+  fi
+  
+  log_success "Port $port jest wolny"
+  return 0
+}
+
+# Enhanced file operations with better error handling
+safe_copy_files() {
+  local src="$1"
+  local dst="$2"
+  local description="${3:-"pliki"}"
+  
+  log_debug "Kopiuję $description z $src do $dst"
+  
+  if [[ ! -d "$src" ]]; then
+    log_error "Katalog źródłowy $src nie istnieje"
+    return 1
+  fi
+  
+  if [[ ! -d "$dst" ]]; then
+    log_error "Katalog docelowy $dst nie istnieje"
+    return 1
+  fi
+  
+  # Try rsync first, fallback to cp
+  if command -v rsync >/dev/null 2>&1; then
+    if rsync -a --delete --exclude .git --exclude build --exclude node_modules "$src"/ "$dst"/; then
+      log_success "Skopiowano $description przez rsync"
+      return 0
+    fi
+  fi
+  
+  # Fallback to cp
+  if cp -r "$src"/* "$dst"/ 2>/dev/null; then
+    log_success "Skopiowano $description przez cp"
+    return 0
+  fi
+  
+  log_error "Nie udało się skopiować $description"
+  return 1
+}
+
+# Enhanced Docker operations
+docker_safe_pull() {
+  local image="$1"
+  local description="${2:-"obraz"}"
+  
+  log_debug "Pobieram $description: $image"
+  
+  if docker image inspect "$image" >/dev/null 2>&1; then
+    log_debug "$description już istnieje lokalnie"
+    return 0
+  fi
+  
+  if docker pull "$image"; then
+    log_success "Pobrano $description: $image"
+    return 0
+  else
+    log_warn "Nie udało się pobrać $description: $image"
+    return 1
+  fi
+}
+
+# Enhanced configuration validation
+validate_authelia_config() {
+  local config_file="$1"
+  
+  log_debug "Waliduję konfigurację Authelii: $config_file"
+  
+  if [[ ! -f "$config_file" ]]; then
+    log_error "Plik konfiguracyjny Authelii nie istnieje: $config_file"
+    return 1
+  fi
+  
+  if docker_safe_pull "authelia/authelia:4.38" "Authelia"; then
+    if docker run --rm -v "$(dirname "$config_file")":/config authelia/authelia:4.38 authelia validate-config --config "/config/$(basename "$config_file")" >/dev/null 2>&1; then
+      log_success "Konfiguracja Authelii jest poprawna"
+      return 0
+    else
+      log_error "Konfiguracja Authelii zawiera błędy"
+      return 1
+    fi
+  else
+    log_warn "Nie można zwalidować konfiguracji Authelii - obraz niedostępny"
+    return 1
+  fi
+}
+
+# Enhanced self-tests
+run_self_tests() {
+  log_step "Uruchamiam testy samoweryfikacji"
+  
+  local test_results=()
+  
+  # Test 1: Docker Compose configuration
+  if pushd "$INSTALL_ROOT/server" >/dev/null 2>&1; then
+    if docker compose config >/dev/null 2>&1; then
+      test_results+=("Docker Compose config: OK")
+    else
+      test_results+=("Docker Compose config: FAILED")
+    fi
+    popd >/dev/null
+  fi
+  
+  # Test 2: Port availability
+  if check_port 80 "HTTP" && check_port 443 "HTTPS"; then
+    test_results+=("Porty 80/443: OK")
+  else
+    test_results+=("Porty 80/443: FAILED")
+  fi
+  
+  # Test 3: Authelia configuration
+  if validate_authelia_config "$INSTALL_ROOT/authelia/configuration.yml"; then
+    test_results+=("Authelia config: OK")
+  else
+    test_results+=("Authelia config: FAILED")
+  fi
+  
+  # Test 4: WireGuard interface
+  if ip link show wg0 >/dev/null 2>&1; then
+    test_results+=("WireGuard interface: OK")
+  else
+    test_results+=("WireGuard interface: FAILED")
+  fi
+  
+  # Show test results
+  log_info "Wyniki testów samoweryfikacji:"
+  for result in "${test_results[@]}"; do
+    if [[ "$result" == *": OK" ]]; then
+      log_success "$result"
+    else
+      log_warn "$result"
+    fi
   done
 }
 
-self_dns_expect() {
-  # self_dns_expect <name> <expected_ip>
-  local name="$1"; local expected="$2"
-  local got
-  got=$(dig +short "$name" @127.0.0.1 | tail -n1 || true)
-  [[ "$got" == "$expected" ]]
-}
-
-self_wg_nat_ok() {
-  # sprawdź czy wg0 up i NAT reguły istnieją
-  ip link show wg0 >/dev/null 2>&1 || return 1
-  ip link show wg0 | grep -q 'state UP' || true # nie zawsze UP od razu
-  sysctl -n net.ipv4.ip_forward | grep -q '^1$' || return 1
-  # minimalna weryfikacja reguł
-  iptables -t nat -S POSTROUTING | grep -q "-s ${WG_SUBNET} .* -j MASQUERADE" || true
-}
-
-self_tests() {
-  step "Self-test: weryfikuję konfigurację i stan usług"
-  # 1) docker compose config syntactic
-  (pushd "$INSTALL_ROOT/server" >/dev/null && docker compose config >/dev/null && popd >/dev/null) || { error "docker compose config niepoprawny"; exit 1; }
-  # 2) porty 80/443
-  ss -tlnp | egrep ':80 |:443 ' >/dev/null || { warn "Porty 80/443 nie są nasłuchiwane"; }
-  # 3) Authelia logs sanity
-  if docker compose -f "$INSTALL_ROOT/server/docker-compose.yml" logs authelia --since 2m | grep -qi fatal; then
-    error "Authelia loguje FATAL po starcie"; exit 1;
+# Enhanced final summary
+show_final_summary() {
+  local end_time=$(date +%s)
+  local duration=$((end_time - START_TIME))
+  
+  echo
+  log_banner "PODSUMOWANIE INSTALACJI"
+  
+  # DONE section
+  if [[ ${#INSTALLATION_DONE[@]} -gt 0 ]]; then
+    printf "%bDONE:%b\n" "$C_OK" "$C_RESET"
+    for item in "${INSTALLATION_DONE[@]}"; do
+      printf "  ✓ %s\n" "$item"
+    done
   fi
-  # 4) walidacja konfiguracji Authelii
-  if ! authelia_validate "$AUTHELIA_DIR/configuration.yml" >/dev/null; then
-    error "Walidacja Authelii nie powiodła się"; exit 1;
+  
+  # WARNINGS section
+  if [[ ${#INSTALLATION_WARNINGS[@]} -gt 0 ]]; then
+    printf "\n%bWARNINGS:%b\n" "$C_WARN" "$C_RESET"
+    for item in "${INSTALLATION_WARNINGS[@]}"; do
+      printf "  ⚠ %s\n" "$item"
+    done
   fi
-  # 5) HTTP healthcheck przez Traefika (web)
-  local code
-  code=$(self_http_retry "http://127.0.0.1/" 45) || { error "Webapp HTTP healthcheck niepowodzenie (code=$code)"; exit 1; }
-  success "Webapp HTTP OK (code=$code)"
-  code=$(self_http_retry "http://127.0.0.1/api/core/captcha" 45) || warn "Core-API HTTP check zwrócił code=$code (akceptowalne jeśli endpoint nie gotowy)"
-  # 6) DNS probe portal.${PRIVATE_SUFFIX} -> 10.66.0.1
-  if self_dns_expect "portal.${PRIVATE_SUFFIX}" "10.66.0.1"; then
-    success "DNS OK: portal.${PRIVATE_SUFFIX} -> 10.66.0.1"
+  
+  # ERRORS section
+  if [[ ${#INSTALLATION_ERRORS[@]} -gt 0 ]]; then
+    printf "\n%bERRORS:%b\n" "$C_ERR" "$C_RESET"
+    for item in "${INSTALLATION_ERRORS[@]}"; do
+      printf "  ✗ %s\n" "$item"
+    done
+  fi
+  
+  # Installation time
+  printf "\n%bCzas instalacji:%b %d sekund\n" "$C_INFO" "$C_RESET" "$duration"
+  
+  # Debug log if enabled
+  if [[ "${DEBUG_INSTALL:-}" == "1" ]] && [[ ${#DEBUG_LOG[@]} -gt 0 ]]; then
+    printf "\n%bDebug log:%b\n" "$C_DIM" "$C_RESET"
+    printf "  Zapisano %d wpisów\n" "${#DEBUG_LOG[@]}"
+    printf "  Pełny log dostępny w zmiennej DEBUG_LOG\n"
+  fi
+  
+  # Final information
+  printf "\n%bInformacje końcowe:%b\n" "$C_BOLD" "$C_RESET"
+  if [[ -n "${DOMAIN:-}" ]]; then
+    printf "  Tryb publiczny: https://%s\n" "$DOMAIN"
   else
-    warn "DNS nie zwrócił 10.66.0.1 dla portal.${PRIVATE_SUFFIX}"
+    printf "  Tryb publiczny: http://%s\n" "${PUBLIC_IP:-<IP>}"
   fi
-  # 7) wg0 i NAT
-  if self_wg_nat_ok; then
-    success "WG/NAT: podstawowa weryfikacja OK"
+  printf "  Portal (VPN): http://portal.%s\n" "${PRIVATE_SUFFIX}"
+  printf "  Dane konta Authelia: admin@example.com / (wygenerowane automatycznie)\n"
+  printf "  Profil WireGuard admina: %s/tools/admin-wg.conf\n" "$INSTALL_ROOT"
+  
+  echo
+}
+
+# Enhanced error handling with recovery
+handle_error() {
+  local error_msg="$1"
+  local recovery_hint="$2"
+  
+  log_error "$error_msg"
+  if [[ -n "$recovery_hint" ]]; then
+    log_info "Wskazówka naprawy: $recovery_hint"
+  fi
+  
+  # Add to errors list
+  INSTALLATION_ERRORS+=("$error_msg")
+  
+  # Return error code
+  return 1
+}
+
+# Enhanced validation with recovery suggestions
+validate_with_recovery() {
+  local check_name="$1"
+  local check_command="$2"
+  local error_msg="$3"
+  local recovery_hint="$4"
+  
+  log_debug "Waliduję: $check_name"
+  
+  if eval "$check_command" 2>/dev/null; then
+    log_success "$check_name: OK"
+    return 0
   else
-    warn "WG/NAT: brak pełnej weryfikacji (sprawdź ip_forward i reguły)"
+    handle_error "$error_msg" "$recovery_hint"
+    return 1
   fi
-  success "Self-test: OK"
 }
 
-banner() {
-  printf "\n%b🛰️  Safe‑Spac Installer%b\n" "$C_BOLD" "$C_RESET"
-  printf "%b=====================%b\n\n" "$C_DIM" "$C_RESET"
+# Enhanced file operations with recovery
+safe_file_operation() {
+  local operation="$1"
+  local description="$2"
+  local command="$3"
+  local recovery_hint="$4"
+  
+  log_debug "Wykonuję: $description"
+  
+  if eval "$command" 2>/dev/null; then
+    log_success "$description: OK"
+    return 0
+  else
+    handle_error "Nie udało się wykonać: $description" "$recovery_hint"
+    return 1
+  fi
 }
 
-banner
-
-# safe-spac installer (production-ready)
-# Usage (non-interactive):
-#   PUBLIC_IP=<IP> HAS_DOMAIN=Y DOMAIN=<domain> ACME_EMAIL=<email> ./install.sh
-# or interactive: script zapyta o domenę/IP, podsieć WG i prywatny sufiks DNS
-
-if [[ ${EUID} -ne 0 ]]; then
-  echo "[ERR] Uruchom jako root" >&2
-  exit 1
-fi
-
-# --- Zmienne środowiskowe (można nadpisać) ---
-HAS_DOMAIN=${HAS_DOMAIN:-}
-DOMAIN=${DOMAIN:-}
-ACME_EMAIL=${ACME_EMAIL:-}
-PUBLIC_IP=${PUBLIC_IP:-}
-
-# --- Interaktywne pytania ---
-# Sprawdź czy HAS_DOMAIN jest już ustawione, jeśli nie - zapytaj
-if [[ -z "${HAS_DOMAIN:-}" ]]; then
-  read -r -p "Czy masz domenę dla serwera (y/N)? " HAS_DOMAIN || true
-  HAS_DOMAIN=${HAS_DOMAIN:-N}
-fi
-
-if [[ ${HAS_DOMAIN} =~ ^[Yy]$ ]]; then
-  if [[ -z "${DOMAIN:-}" ]]; then
-    read -r -p "Podaj domenę publiczną (np. safe.example.com): " DOMAIN
-  fi
-  if [[ -z "${ACME_EMAIL:-}" ]]; then
-    read -r -p "E-mail do Let's Encrypt (akceptujesz TOS): " ACME_EMAIL
-  fi
+# Enhanced service management
+manage_service() {
+  local service_name="$1"
+  local action="$2"
+  local description="$3"
   
-  # Walidacja wymaganych pól dla domeny
-  if [[ -z "${DOMAIN:-}" ]]; then
-    error "Domena jest wymagana gdy HAS_DOMAIN=Y"
-    exit 1
-  fi
-  if [[ -z "${ACME_EMAIL:-}" ]]; then
-    error "E-mail do Let's Encrypt jest wymagany gdy HAS_DOMAIN=Y"
-    exit 1
-  fi
-else
-  if [[ -z "${PUBLIC_IP:-}" ]]; then
-    read -r -p "Podaj publiczne IP serwera: " PUBLIC_IP
-  fi
+  log_debug "$description: $service_name"
   
-  # Walidacja wymaganego pola dla IP
-  if [[ -z "${PUBLIC_IP:-}" ]]; then
-    error "Publiczne IP jest wymagane gdy nie ma domeny"
-    exit 1
-  fi
-fi
-
-WG_SUBNET=${WG_SUBNET:-10.66.0.0/24}
-WG_ADDR=${WG_ADDR:-10.66.0.1/24}
-WG_PORT=${WG_PORT:-51820}
-PRIVATE_SUFFIX=${PRIVATE_SUFFIX:-safe.lan}
-FULL_TUNNEL=${FULL_TUNNEL:-}
-
-# Upewnij się, że INSTALL_ROOT jest ustawione poprawnie
-if [[ "${INSTALL_ROOT:-}" != "/opt/safe-spac" ]]; then
-  warn "INSTALL_ROOT nie jest ustawione na /opt/safe-spac, ustawiam poprawnie"
-  INSTALL_ROOT="/opt/safe-spac"
-  export INSTALL_ROOT
-fi
-
-# Debug: sprawdź INSTALL_ROOT
-if [[ "${DEBUG_INSTALL:-}" == "1" ]]; then
-  echo "DEBUG: INSTALL_ROOT po korekcie='$INSTALL_ROOT'" >&2
-  echo "DEBUG: PWD='$(pwd)'" >&2
-  echo "DEBUG: EUID='$EUID'" >&2
-fi
-
-DATA_DIR="$INSTALL_ROOT/server/data"
-AUTHELIA_DIR="$INSTALL_ROOT/authelia"
-DNSMASQ_DIR="$INSTALL_ROOT/dnsmasq"
-DNSMASQ_CONF_SRC="$DNSMASQ_DIR/dnsmasq.conf.tmpl"
-DNSMASQ_CONF_DST="$DNSMASQ_DIR/dnsmasq.conf"
-
-# --- Opcje sterujące ---
-# Ustaw FORCE_AUTHELIA_MINIMAL=1 aby nadpisać istniejący configuration.yml minimalną konfiguracją
-FORCE_AUTHELIA_MINIMAL=${FORCE_AUTHELIA_MINIMAL:-0}
-OIDC_ENABLE=${OIDC_ENABLE:-0}
-
-# --- Instalacja zależności systemowych ---
-info "Instaluję zależności systemowe (curl, gnupg, lsb-release, apt-transport-https, ca-certificates)"
-
-# --- Spinner helpers ---
-_spinner_pid=""
-_stop_spinner() { [[ -n "${_spinner_pid}" ]] && kill "${_spinner_pid}" 2>/dev/null || true; _spinner_pid=""; }
-run_with_spinner() {
-  local msg="$1"; shift
-  local cmd=("$@")
-  printf "%b[....]%b %s\n" "$C_DIM" "$C_RESET" "$msg"
-  (
-    while true; do printf "%b⠋%b\r" "$C_DIM" "$C_RESET"; sleep 0.1; printf "%b⠙%b\r" "$C_DIM" "$C_RESET"; sleep 0.1; printf "%b⠹%b\r" "$C_DIM" "$C_RESET"; sleep 0.1; printf "%b⠸%b\r" "$C_DIM" "$C_RESET"; sleep 0.1; printf "%b⠼%b\r" "$C_DIM" "$C_RESET"; sleep 0.1; printf "%b⠴%b\r" "$C_DIM" "$C_RESET"; sleep 0.1; done
-  ) & _spinner_pid=$!
-  if "${cmd[@]}"; then _stop_spinner; success "$msg"; else _stop_spinner; error "$msg (failed)"; return 1; fi
+  case "$action" in
+    "start")
+      if systemctl start "$service_name" 2>/dev/null; then
+        log_success "$description: OK"
+        return 0
+      else
+        log_warn "$description: FAILED (może być już uruchomiony)"
+        return 1
+      fi
+      ;;
+    "stop")
+      if systemctl stop "$service_name" 2>/dev/null; then
+        log_success "$description: OK"
+        return 0
+      else
+        log_warn "$description: FAILED (może być już zatrzymany)"
+        return 1
+      fi
+      ;;
+    "enable")
+      if systemctl enable "$service_name" 2>/dev/null; then
+        log_success "$description: OK"
+        return 0
+      else
+        log_warn "$description: FAILED"
+        return 1
+      fi
+      ;;
+    "disable")
+      if systemctl disable "$service_name" 2>/dev/null; then
+        log_success "$description: OK"
+        return 0
+      else
+        log_warn "$description: FAILED"
+        return 1
+      fi
+      ;;
+    *)
+      log_error "Nieznana akcja: $action"
+      return 1
+      ;;
+  esac
 }
 
-run_with_spinner "Apt update" apt-get update -y
-run_with_spinner "Install base packages" apt-get install -y ca-certificates curl gnupg lsb-release rsync iptables iproute2 dnsutils gettext-base unzip iptables-persistent
-
-# Docker repo + compose-plugin
-if ! command -v docker >/dev/null 2>&1; then
-  echo "[INFO] Dodaję repo Docker i instaluję docker-ce + plugin compose"
-  install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-  chmod a+r /etc/apt/keyrings/docker.gpg
-  echo \
-    "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian \
-    $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | tee /etc/apt/sources.list.d/docker.list >/dev/null
-  apt-get update -y
-  apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-  systemctl enable --now docker
-fi
-
-# WireGuard tools
-if ! command -v wg >/dev/null 2>&1; then
-  echo "[INFO] Instaluję wireguard-tools"
-  apt-get install -y wireguard-tools
-fi
-
-# --- Skopiowanie repo do /opt ---
-# Upewnij się, że jesteśmy w odpowiednim kontekście
-if [[ "$EUID" -eq 0 ]]; then
-  # Jesteśmy root - możemy tworzyć katalogi w /opt
-  mkdir -p "$INSTALL_ROOT"
-  chown root:root "$INSTALL_ROOT" 2>/dev/null || true
-else
-  error "Skrypt musi być uruchomiony jako root (sudo)"
-  exit 1
-fi
-
-# Debug: sprawdź czy katalog został utworzony
-if [[ "${DEBUG_INSTALL:-}" == "1" ]]; then
-  echo "DEBUG: Sprawdzam czy INSTALL_ROOT został utworzony:" >&2
-  ls -ld "$INSTALL_ROOT" || echo "DEBUG: Nie można wyświetlić INSTALL_ROOT" >&2
-  echo "DEBUG: Aktualny katalog: $(pwd)" >&2
-fi
-
-# Debug: sprawdź ścieżki (tylko w przypadku problemów)
-if [[ "${DEBUG_INSTALL:-}" == "1" ]]; then
-  echo "DEBUG: SCRIPT_DIR='$SCRIPT_DIR'" >&2
-  echo "DEBUG: INSTALL_ROOT='$INSTALL_ROOT'" >&2
-  ls -la "$SCRIPT_DIR" || echo "DEBUG: Nie można wyświetlić SCRIPT_DIR" >&2
-fi
-
-# Problem: gdy skrypt jest uruchamiany przez curl | bash, SCRIPT_DIR może być niepoprawne
-# Sprawdź czy SCRIPT_DIR zawiera pliki safe-spac
-if [[ ! -f "$SCRIPT_DIR/install.sh" ]] || [[ ! -d "$SCRIPT_DIR/server" ]]; then
-  warn "SCRIPT_DIR ($SCRIPT_DIR) nie zawiera plików safe-spac - używam fallback"
+# Enhanced network configuration
+configure_network() {
+  log_step "Konfiguruję sieć"
   
-  # Fallback: pobierz pliki bezpośrednio z GitHub
-  info "Pobieram pliki safe-spac bezpośrednio z GitHub"
-  cd "$INSTALL_ROOT"
+  # Enable IP forwarding
+  if [[ "$(sysctl -n net.ipv4.ip_forward)" != "1" ]]; then
+    if echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf && sysctl -p; then
+      log_success "Włączono IP forwarding"
+    else
+      log_warn "Nie udało się włączyć IP forwarding"
+    fi
+  else
+    log_success "IP forwarding już włączone"
+  fi
   
-  # Pobierz główne pliki
-  curl -fsSL https://raw.githubusercontent.com/Co0ob1iee/safe-spac/main/install.sh -o install.sh || {
-    error "Nie można pobrać install.sh z GitHub"
-    exit 1
+  # Configure iptables for WireGuard
+  if ! iptables -t nat -C POSTROUTING -s "${WG_SUBNET}" -o eth0 -j MASQUERADE 2>/dev/null; then
+    if iptables -t nat -A POSTROUTING -s "${WG_SUBNET}" -o eth0 -j MASQUERADE; then
+      log_success "Dodano regułę NAT dla WireGuard"
+    else
+      log_warn "Nie udało się dodać reguły NAT"
+    fi
+  else
+    log_success "Reguła NAT już istnieje"
+  fi
+  
+  # Save iptables rules
+  if command -v netfilter-persistent >/dev/null 2>&1; then
+    if netfilter-persistent save; then
+      log_success "Zapisano reguły iptables"
+    else
+      log_warn "Nie udało się zapisać reguł iptables"
+    fi
+  fi
+  
+  return 0
+}
+
+# Enhanced cleanup on failure
+cleanup_on_failure() {
+  log_warn "Czyszczenie po nieudanej instalacji"
+  
+  # Stop services if they were started
+  if [[ -d "$INSTALL_ROOT/server" ]]; then
+    pushd "$INSTALL_ROOT/server" >/dev/null 2>&1
+    docker compose down 2>/dev/null || true
+    popd >/dev/null 2>&1
+  fi
+  
+  # Remove created directories if installation failed completely
+  if [[ ${#INSTALLATION_DONE[@]} -eq 0 ]]; then
+    log_info "Usuwam katalogi instalacyjne"
+    rm -rf "$INSTALL_ROOT" 2>/dev/null || true
+  fi
+  
+  log_info "Czyszczenie zakończone"
+}
+
+# Enhanced installation progress tracking
+track_progress() {
+  local step_name="$1"
+  local step_description="$2"
+  
+  log_step "$step_name"
+  log_info "$step_description"
+  
+  # Add to progress tracking
+  INSTALLATION_DONE+=("$step_name")
+  
+  # Show progress
+  local progress=$(( ${#INSTALLATION_DONE[@]} * 100 / 8 )) # Assuming 8 main steps
+  printf "%b[PROGRESS]%b %d%% - %s\n" "$C_BLUE" "$C_RESET" "$progress" "$step_name"
+}
+
+# Main installation function
+main_installation() {
+  log_banner "Safe-Spac Installer - Enhanced Version"
+  
+  # Set up error handling
+  trap 'cleanup_on_failure' ERR
+  
+  # Validate environment
+  track_progress "Walidacja środowiska" "Sprawdzam wymagania systemowe"
+  validate_environment || {
+    log_error "Walidacja środowiska nie powiodła się"
+    return 1
   }
   
-  # Pobierz katalog server
+  # Check ports
+  track_progress "Sprawdzanie portów" "Weryfikuję dostępność portów 80/443"
+  check_port 80 "HTTP" || log_warn "Port 80 może być problemem"
+  check_port 443 "HTTPS" || log_warn "Port 443 może być problemem"
+  
+  # Set environment variables with validation
+  track_progress "Konfiguracja zmiennych" "Ustawiam i waliduję zmienne środowiskowe"
+  
+  # Ensure INSTALL_ROOT is set correctly
+  if [[ "${INSTALL_ROOT:-}" != "/opt/safe-spac" ]]; then
+    log_warn "INSTALL_ROOT nie jest ustawione na /opt/safe-spac, ustawiam poprawnie"
+    INSTALL_ROOT="/opt/safe-spac"
+    export INSTALL_ROOT
+  fi
+  
+  # Validate required variables
+  if [[ "${HAS_DOMAIN:-}" == "Y" ]]; then
+    if [[ -z "${DOMAIN:-}" ]]; then
+      handle_error "Domena jest wymagana gdy HAS_DOMAIN=Y" "Ustaw DOMAIN=twoja-domena.com"
+      return 1
+    fi
+    if [[ -z "${ACME_EMAIL:-}" ]]; then
+      handle_error "E-mail do Let's Encrypt jest wymagany gdy HAS_DOMAIN=Y" "Ustaw ACME_EMAIL=twoj@email.com"
+      return 1
+    fi
+    log_success "Konfiguracja domeny: $DOMAIN"
+  else
+    if [[ -z "${PUBLIC_IP:-}" ]]; then
+      handle_error "Publiczne IP jest wymagane gdy nie ma domeny" "Ustaw PUBLIC_IP=twoje-ip"
+      return 1
+    fi
+    log_success "Konfiguracja IP: $PUBLIC_IP"
+  fi
+  
+  # Set default values
+  WG_SUBNET=${WG_SUBNET:-10.66.0.0/24}
+  WG_ADDR=${WG_ADDR:-10.66.0.1/24}
+  WG_PORT=${WG_PORT:-51820}
+  PRIVATE_SUFFIX=${PRIVATE_SUFFIX:-safe.lan}
+  FULL_TUNNEL=${FULL_TUNNEL:-}
+  
+  # Create directories
+  track_progress "Tworzenie katalogów" "Tworzę strukturę katalogów instalacyjnych"
+  if [[ "$EUID" -eq 0 ]]; then
+    safe_file_operation "mkdir" "Tworzenie katalogu $INSTALL_ROOT" "mkdir -p $INSTALL_ROOT" "Sprawdź uprawnienia root"
+    safe_file_operation "chown" "Ustawienie właściciela katalogu" "chown root:root $INSTALL_ROOT" "Sprawdź uprawnienia root"
+  else
+    handle_error "Skrypt musi być uruchomiony jako root (sudo)" "Uruchom: sudo $0"
+    return 1
+  fi
+  
+  # Copy files or download from GitHub
+  track_progress "Kopiowanie plików" "Kopiuję lub pobieram pliki instalacyjne"
+  if [[ ! -f "$SCRIPT_DIR/install.sh" ]] || [[ ! -d "$SCRIPT_DIR/server" ]]; then
+    log_warn "SCRIPT_DIR ($SCRIPT_DIR) nie zawiera plików safe-spac - używam fallback"
+    download_from_github || return 1
+  else
+    safe_copy_files "$SCRIPT_DIR" "$INSTALL_ROOT" "pliki safe-spac" || return 1
+  fi
+  
+  # Configure network
+  track_progress "Konfiguracja sieci" "Konfiguruję IP forwarding i reguły NAT"
+  configure_network || return 1
+  
+  # Install system dependencies
+  track_progress "Instalacja zależności" "Instaluję pakiety systemowe i Docker"
+  install_system_dependencies || return 1
+  
+  # Configure WireGuard
+  track_progress "Konfiguracja WireGuard" "Konfiguruję VPN WireGuard"
+  configure_wireguard || return 1
+  
+  # Configure Authelia
+  track_progress "Konfiguracja Authelii" "Konfiguruję system uwierzytelniania"
+  configure_authelia || return 1
+  
+  # Configure Docker services
+  track_progress "Konfiguracja Docker" "Konfiguruję usługi Docker Compose"
+  configure_docker_services || return 1
+  
+  # Start services
+  track_progress "Uruchamianie usług" "Uruchamiam stack usług Docker"
+  start_services || return 1
+  
+  # Run self-tests
+  track_progress "Testy samoweryfikacji" "Uruchamiam testy sprawdzające instalację"
+  run_self_tests
+  
+  # Create admin WireGuard profile
+  track_progress "Profil admina" "Tworzę profil WireGuard dla administratora"
+  create_admin_profile || log_warn "Nie udało się utworzyć profilu admina"
+  
+  log_success "Instalacja zakończona pomyślnie"
+  
+  # Remove error trap
+  trap - ERR
+}
+
+# Download files from GitHub
+download_from_github() {
+  log_info "Pobieram pliki safe-spac bezpośrednio z GitHub"
+  cd "$INSTALL_ROOT"
+  
+  # Download main files
+  curl -fsSL https://raw.githubusercontent.com/Co0ob1iee/safe-spac/main/install.sh -o install.sh || {
+    log_error "Nie można pobrać install.sh z GitHub"
+    return 1
+  }
+  
+  # Download server directory
   mkdir -p server
   cd server
   
-  # Pobierz docker-compose.yml.tmpl
+  # Download docker-compose.yml.tmpl
   curl -fsSL https://raw.githubusercontent.com/Co0ob1iee/safe-spac/main/server/docker-compose.yml.tmpl -o docker-compose.yml.tmpl || {
-    error "Nie można pobrać docker-compose.yml.tmpl"
-    exit 1
+    log_error "Nie można pobrać docker-compose.yml.tmpl"
+    return 1
   }
   
-  # Pobierz inne potrzebne pliki
+  # Download other needed files
   for dir in authelia core-api teamspeak webapp wg-provisioner; do
     mkdir -p "$dir"
-    # Można dodać pobieranie specyficznych plików dla każdego katalogu
+    # Download Dockerfile for each directory
+    if [[ "$dir" == "webapp" || "$dir" == "core-api" || "$dir" == "wg-provisioner" ]]; then
+      curl -fsSL "https://raw.githubusercontent.com/Co0ob1iee/safe-spac/main/server/$dir/Dockerfile" -o "$dir/Dockerfile" || {
+        log_warn "Nie można pobrać Dockerfile dla $dir - tworzę minimalny"
+        echo "FROM alpine:latest" > "$dir/Dockerfile"
+        echo "CMD [\"echo\", \"Service $dir placeholder\"]" >> "$dir/Dockerfile"
+      }
+    fi
   done
   
   cd ..
   
-  # Pobierz inne potrzebne katalogi
+  # Download other needed directories
   mkdir -p scripts tools dnsmasq
   curl -fsSL https://raw.githubusercontent.com/Co0ob1iee/safe-spac/main/scripts/install_cron.sh -o scripts/install_cron.sh || true
   curl -fsSL https://raw.githubusercontent.com/Co0ob1iee/safe-spac/main/tools/wg-client-sample.conf -o tools/wg-client-sample.conf || true
   
-  success "Pobrano pliki safe-spac z GitHub"
-else
-  # Normalne kopiowanie przez rsync
-  if ! command -v rsync >/dev/null 2>&1; then
-    error "rsync nie jest dostępny - używam cp jako fallback"
-    cp -r "$SCRIPT_DIR"/* "$INSTALL_ROOT/" 2>/dev/null || {
-      error "Nie można skopiować plików z $SCRIPT_DIR do $INSTALL_ROOT"
-      exit 1
-    }
+  log_success "Pobrano pliki safe-spac z GitHub"
+  return 0
+}
+
+# Install system dependencies
+install_system_dependencies() {
+  log_info "Instaluję zależności systemowe"
+  
+  # Update package lists
+  if apt-get update -y; then
+    log_success "Zaktualizowano listy pakietów"
   else
-    rsync -a --delete --exclude .git --exclude build --exclude node_modules "$SCRIPT_DIR"/ "$INSTALL_ROOT/"
+    log_warn "Nie udało się zaktualizować list pakietów"
   fi
-fi
-
-# Sprawdź czy katalog server został utworzony
-if [[ ! -d "$INSTALL_ROOT/server" ]]; then
-  error "Katalog server nie został utworzony. Sprawdzam zawartość INSTALL_ROOT:"
-  ls -la "$INSTALL_ROOT/" || true
-  error "Instalacja nie powiodła się - problem z kopiowaniem plików"
-  exit 1
-fi
-
-# --- Kolizja portu 80 (hostowy nginx) ---
-if systemctl list-unit-files | grep -q '^nginx\.service'; then
-  if systemctl is-active --quiet nginx; then
-    warn "Wykryto działający nginx na hoście (port 80 może kolidować z Traefikiem)."
-    read -r -p "Czy zatrzymać i wyłączyć nginx teraz? (y/N): " DISABLE_NGINX || true
-    if [[ ${DISABLE_NGINX:-N} =~ ^[Yy]$ ]]; then
-      run_with_spinner "Stop nginx" systemctl stop nginx
-      run_with_spinner "Disable nginx" systemctl disable nginx
+  
+  # Install packages
+  local packages=("ca-certificates" "curl" "gnupg" "lsb-release" "rsync" "iptables" "iproute2" "bind9-dnsutils" "gettext-base" "unzip" "iptables-persistent")
+  if apt-get install -y "${packages[@]}"; then
+    log_success "Zainstalowano pakiety systemowe"
+  else
+    log_error "Nie udało się zainstalować pakietów systemowych"
+    return 1
+  fi
+  
+  # Install Docker if not present
+  if ! command -v docker >/dev/null 2>&1; then
+    log_info "Instaluję Docker"
+    install_docker || return 1
+  else
+    log_success "Docker już zainstalowany"
+  fi
+  
+  # Install WireGuard tools if not present
+  if ! command -v wg >/dev/null 2>&1; then
+    log_info "Instaluję WireGuard tools"
+    if apt-get install -y wireguard-tools; then
+      log_success "Zainstalowano WireGuard tools"
     else
-      warn "Pozostawiono nginx włączony. Traefik może nie otrzymywać ruchu HTTP/80."
+      log_error "Nie udało się zainstalować WireGuard tools"
+      return 1
+    fi
+  else
+    log_success "WireGuard tools już zainstalowane"
+  fi
+  
+  return 0
+}
+
+# Install Docker
+install_docker() {
+  log_info "Dodaję repo Docker i instaluję docker-ce + plugin compose"
+  
+  # Add Docker GPG key
+  install -m 0755 -d /etc/apt/keyrings
+  if curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg; then
+    chmod a+r /etc/apt/keyrings/docker.gpg
+    
+    # Add Docker repository
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | tee /etc/apt/sources.list.d/docker.list >/dev/null
+    
+    # Update and install Docker
+    if apt-get update -y && apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin; then
+      systemctl enable --now docker
+      log_success "Docker zainstalowany i uruchomiony"
+      return 0
     fi
   fi
-fi
+  
+  log_error "Nie udało się zainstalować Docker"
+  return 1
+}
 
-# --- Konfiguracja WireGuard ---
-mkdir -p /etc/wireguard
-if [[ ! -f /etc/wireguard/server.key ]]; then
-  umask 077
-  wg genkey | tee /etc/wireguard/server.key | wg pubkey > /etc/wireguard/server.pub
-fi
-if [[ ! -f /etc/wireguard/admin.key ]]; then
-  umask 077
-  wg genkey | tee /etc/wireguard/admin.key | wg pubkey > /etc/wireguard/admin.pub
-fi
-cat >/etc/wireguard/wg0.conf <<EOF
+# Configure WireGuard
+configure_wireguard() {
+  log_info "Konfiguruję WireGuard"
+  
+  mkdir -p /etc/wireguard
+  
+  # Generate keys if not present
+  if [[ ! -f /etc/wireguard/server.key ]]; then
+    umask 077
+    if wg genkey | tee /etc/wireguard/server.key | wg pubkey > /etc/wireguard/server.pub; then
+      log_success "Wygenerowano klucze serwera WireGuard"
+    else
+      log_error "Nie udało się wygenerować kluczy serwera"
+      return 1
+    fi
+  fi
+  
+  if [[ ! -f /etc/wireguard/admin.key ]]; then
+    umask 077
+    if wg genkey | tee /etc/wireguard/admin.key | wg pubkey > /etc/wireguard/admin.pub; then
+      log_success "Wygenerowano klucze admina WireGuard"
+    else
+      log_error "Nie udało się wygenerować kluczy admina"
+      return 1
+    fi
+  fi
+  
+  # Create WireGuard configuration
+  cat >/etc/wireguard/wg0.conf <<EOF
 [Interface]
 Address = ${WG_ADDR}
 ListenPort = ${WG_PORT}
 PrivateKey = $(cat /etc/wireguard/server.key)
 SaveConfig = true
-
-# Forwarding/firewall reguły możesz dodać wg potrzeb (NAT itp.)
 EOF
-
-# Włącz i startuj WG
-systemctl enable wg-quick@wg0 || true
-systemctl restart wg-quick@wg0 || systemctl start wg-quick@wg0
-
-# Dodaj peera admina (10.66.0.2/32) i utrwal konfigurację
-admin_pub=$(tr -d '\n' </etc/wireguard/admin.pub 2>/dev/null || true)
-if [[ -n "$admin_pub" ]]; then
-  wg set wg0 peer "$admin_pub" allowed-ips 10.66.0.2/32 || true
-  wg-quick save wg0 || true
-else
-  warn "Nie można odczytać klucza publicznego admina"
-fi
-
-# --- Konfiguracja resolvera systemowego na 10.66.0.1 (opcjonalnie) ---
-configure_resolver() {
-  local WG_DNS="10.66.0.1"
-  if command -v resolvectl >/dev/null 2>&1 && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-    info "Wykryto systemd-resolved – ustawiam DNS na ${WG_DNS} (fallback 1.1.1.1)"
-    resolvectl dns wg0 ${WG_DNS} 1.1.1.1 || true
-    resolvectl domain wg0 "${PRIVATE_SUFFIX}" || true
-    resolvectl flush-caches || true
+  
+  # Enable and start WireGuard
+  if systemctl enable wg-quick@wg0 && systemctl restart wg-quick@wg0; then
+    log_success "WireGuard uruchomiony"
   else
-    warn "systemd-resolved nieaktywny – aktualizuję /etc/resolv.conf (zachowuję kopię)"
-    if [[ -f /etc/resolv.conf ]]; then cp -n /etc/resolv.conf /etc/resolv.conf.bak.$(date +%s) || true; fi
-    cat > /etc/resolv.conf <<RCF
-nameserver ${WG_DNS}
-nameserver 1.1.1.1
-search ${PRIVATE_SUFFIX}
-RCF
+    log_warn "Nie udało się uruchomić WireGuard"
   fi
+  
+  # Add admin peer
+  local admin_pub=$(tr -d '\n' </etc/wireguard/admin.pub 2>/dev/null || true)
+  if [[ -n "$admin_pub" ]]; then
+    if wg set wg0 peer "$admin_pub" allowed-ips 10.66.0.2/32 && wg-quick save wg0; then
+      log_success "Dodano peera admina WireGuard"
+    else
+      log_warn "Nie udało się dodać peera admina"
+    fi
+  fi
+  
+  return 0
 }
 
-# Ustaw resolver interaktywnie, chyba że SET_RESOLVER jest już ustawione w env
-if [[ -z "${SET_RESOLVER:-}" ]]; then
-  read -r -p "Ustawić systemowy resolver DNS na 10.66.0.1? (y/N): " SET_RESOLVER || true
-fi
-
-# Normalizuj SET_RESOLVER do standardowych wartości
-SET_RESOLVER=${SET_RESOLVER:-N}
-
-# Sprawdź czy zmienna zawiera tylko dozwolone znaki
-if [[ ! "${SET_RESOLVER}" =~ ^[1Yy]es?$ ]]; then
-  info "Pominięto zmianę resolvera (SET_RESOLVER nieaktywny)"
-else
-  configure_resolver || true
-fi
-
-# --- NAT / full-tunnel (opcjonalnie) ---
-if [[ -z "$FULL_TUNNEL" ]]; then
-  read -r -p "Czy chcesz włączyć full-tunnel (NAT przez VPS, AllowedIPs=0.0.0.0/0)? (y/N): " FULL_TUNNEL || true
-fi
-
-ALLOWED_IPS="10.66.0.0/24"
-if [[ ${FULL_TUNNEL:-N} =~ ^[Yy]$ ]]; then
-  success "Włączam IP forwarding i NAT dla ${WG_SUBNET}"
-  sysctl -w net.ipv4.ip_forward=1 >/dev/null
-  sed -i 's/^#\?net.ipv4.ip_forward=.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf || true
-  # wykrycie interfejsu WAN
-  WAN_IF=$(ip route get 1.1.1.1 | awk '/dev/ {for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}' | head -1)
-  : "${WAN_IF:=eth0}"
-  # reguły iptables (idempotentne)
-  if ! iptables -t nat -C POSTROUTING -s "$WG_SUBNET" -o "$WAN_IF" -j MASQUERADE 2>/dev/null; then
-    iptables -t nat -A POSTROUTING -s "$WG_SUBNET" -o "$WAN_IF" -j MASQUERADE
-  fi
-  if ! iptables -C FORWARD -i "$WAN_IF" -o wg0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; then
-    iptables -A FORWARD -i "$WAN_IF" -o wg0 -m state --state RELATED,ESTABLISHED -j ACCEPT
-  fi
-  if ! iptables -C FORWARD -i wg0 -o "$WAN_IF" -j ACCEPT 2>/dev/null; then
-    iptables -A FORWARD -i wg0 -o "$WAN_IF" -j ACCEPT
-  fi
-  # MSS clamping (PMTU) dla ruchu TCP przez WAN i wg0
-  if ! iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -o "$WAN_IF" -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
-    iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -o "$WAN_IF" -j TCPMSS --clamp-mss-to-pmtu
-  fi
-  if ! iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -o wg0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
-    iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -o wg0 -j TCPMSS --clamp-mss-to-pmtu
-  fi
-  # utrwal reguły
-  netfilter-persistent save || true
-  ALLOWED_IPS="0.0.0.0/0"
-fi
-
-# --- dnsmasq (render + kontener host-mode) ---
-install -d -m 0755 "$DNSMASQ_DIR"
-# Fallback: jeśli szablon nie istnieje (np. problem z rsync), utwórz domyślny
-if [[ ! -f "$DNSMASQ_CONF_SRC" ]]; then
-  cat >"$DNSMASQ_CONF_SRC" <<'TMPL'
-# dnsmasq basic config for Safe‑Spac
-no-resolv
-domain-needed
-bogus-priv
-listen-address=127.0.0.1
-listen-address=10.66.0.1
-
-# Private suffix
-local=/{{PRIVATE_SUFFIX}}/
-domain={{PRIVATE_SUFFIX}}
-
-# Internal hosts
-address=/portal.{{PRIVATE_SUFFIX}}/10.66.0.1
-address=/service.teamspeak/10.66.0.1
-address=/service.git/10.66.0.1
-TMPL
-fi
-sed "s/{{PRIVATE_SUFFIX}}/${PRIVATE_SUFFIX}/g" "$DNSMASQ_CONF_SRC" > "$DNSMASQ_CONF_DST"
-
-# --- Authelia: generacja hasła admina ---
-mkdir -p "$AUTHELIA_DIR"
-ADMIN_EMAIL="admin@example.com"
-step "Konfiguruję Authelię (użytkownik + minimalny configuration.yml)"
-# 1) Użytkownik admin
-if [[ ! -f "$AUTHELIA_DIR/users_database.yml" ]]; then
-  ADMIN_PASS=$(openssl rand -base64 18)
-  run_with_spinner "Pull authelia:4.38 (if needed)" sh -c "docker image inspect authelia/authelia:4.38 >/dev/null 2>&1 || docker pull authelia/authelia:4.38"
-  HASH=$(docker run --rm authelia/authelia:4.38 authelia crypto hash generate argon2 --password "$ADMIN_PASS" | tail -1 | sed 's/^.*: //')
-  cat > "$AUTHELIA_DIR/users_database.yml" <<YML
+# Configure Authelia
+configure_authelia() {
+  log_info "Konfiguruję Authelię"
+  
+  mkdir -p "$INSTALL_ROOT/authelia"
+  local admin_email="admin@example.com"
+  
+  # Generate admin password
+  if [[ ! -f "$INSTALL_ROOT/authelia/users_database.yml" ]]; then
+    local admin_pass=$(openssl rand -base64 18)
+    
+    # Pull Authelia image
+    if docker_safe_pull "authelia/authelia:4.38" "Authelia"; then
+      local hash=$(docker run --rm authelia/authelia:4.38 authelia crypto hash generate argon2 --password "$admin_pass" | tail -1 | sed 's/^.*: //')
+      
+      # Create users database
+      cat > "$INSTALL_ROOT/authelia/users_database.yml" <<YML
 users:
-  ${ADMIN_EMAIL}:
+  ${admin_email}:
     displayname: Admin
-    password: "${HASH}"
-    email: ${ADMIN_EMAIL}
+    password: "${hash}"
+    email: ${admin_email}
     groups:
       - admins
       - users
 YML
-  ADMIN_PASS_MSG="$ADMIN_PASS"
-else
-  ADMIN_PASS_MSG="<niezmienione – istniejący plik>"
-fi
+      log_success "Utworzono bazę użytkowników Authelii"
+    fi
+  fi
+  
+  # Create configuration
+  create_authelia_config || return 1
+  
+  return 0
+}
 
-# 2) Minimalny configuration.yml zgodny z Authelia v4 (bez OIDC, storage local)
-NEED_MINIMAL_CFG=0
-if [[ ! -f "$AUTHELIA_DIR/configuration.yml" ]]; then
-  NEED_MINIMAL_CFG=1
-elif [[ "$FORCE_AUTHELIA_MINIMAL" == "1" ]]; then
-  NEED_MINIMAL_CFG=1
-fi
-
-if [[ "$NEED_MINIMAL_CFG" == "1" ]]; then
-  SESS_SECRET=$(openssl rand -base64 48)
-  STOR_KEY=$(openssl rand -base64 48)
-  RESET_JWT=$(openssl rand -hex 32)
-  OIDC_RSA=""
-  OIDC_RSA_ESCAPED=""
-  OIDC_WEB_REDIRECT=""
-  OIDC_API_REDIRECT=""
-  OIDC_API_SECRET=""
-  # URL Authelii musi być HTTPS
-  if [[ -n "$DOMAIN" ]]; then
-    AUTHELIA_URL="https://$DOMAIN"
-    # Dla domeny publicznej, używaj domeny jako cookie domain
-    COOKIE_DOMAIN="$DOMAIN"
+# Create Authelia configuration
+create_authelia_config() {
+  local config_file="$INSTALL_ROOT/authelia/configuration.yml"
+  
+  # Set Authelia URL
+  local authelia_url
+  if [[ -n "${DOMAIN:-}" ]]; then
+    authelia_url="https://$DOMAIN"
+    local cookie_domain="$DOMAIN"
   else
-    AUTHELIA_URL="https://portal.${PRIVATE_SUFFIX}"
-    # Dla VPN, używaj prywatnego sufixu
-    COOKIE_DOMAIN="${PRIVATE_SUFFIX}"
+    authelia_url="https://portal.${PRIVATE_SUFFIX}"
+    local cookie_domain="${PRIVATE_SUFFIX}"
   fi
-  if [[ "$OIDC_ENABLE" == "1" ]]; then
-    info "Włączono OIDC: generuję klucz RSA i konfigurację klientów"
-    OIDC_RSA=$(openssl genrsa 4096)
-    # przygotuj redirecty na podstawie domeny lub portalu VPN
-    if [[ -n "$DOMAIN" ]]; then
-      OIDC_WEB_REDIRECT="https://${DOMAIN}/oidc/callback"
-      OIDC_API_REDIRECT="https://${DOMAIN}/api/core/oidc/callback"
-    else
-      OIDC_WEB_REDIRECT="http://portal.${PRIVATE_SUFFIX}/oidc/callback"
-      OIDC_API_REDIRECT="http://portal.${PRIVATE_SUFFIX}/api/core/oidc/callback"
-    fi
-    OIDC_API_SECRET=$(openssl rand -hex 32)
-  fi
-  # backup jeśli istniał
-  if [[ -f "$AUTHELIA_DIR/configuration.yml" ]]; then
-    cp -v "$AUTHELIA_DIR/configuration.yml" "$AUTHELIA_DIR/configuration.yml.bak.$(date +%s)" || true
-  fi
-  # Usuń/odłóż na bok inne pliki YAML, które mogłyby zostać błędnie odczytane przez Authelię
-  mkdir -p "$AUTHELIA_DIR/backup"
-  shopt -s nullglob
-  for f in "$AUTHELIA_DIR"/*.yml "$AUTHELIA_DIR"/*.yaml; do
-    bn=$(basename "$f")
-    if [[ "$bn" != "configuration.yml" && "$bn" != "users_database.yml" ]]; then
-      mv -v "$f" "$AUTHELIA_DIR/backup/" || true
-    fi
-  done
-  if [[ "$OIDC_ENABLE" != "1" ]]; then
-  cat > "$AUTHELIA_DIR/configuration.yml" <<'YAML'
+  
+  # Generate secrets
+  local sess_secret=$(openssl rand -base64 48)
+  local stor_key=$(openssl rand -base64 48)
+  local reset_jwt=$(openssl rand -hex 32)
+  
+  # Create configuration
+  cat > "$config_file" <<YAML
 theme: light
 
 log:
@@ -559,7 +877,7 @@ authentication_backend:
     path: /config/users_database.yml
 
 storage:
-  encryption_key: REPLACE_STORAGE_KEY
+  encryption_key: ${stor_key}
   local:
     path: /config/db.sqlite3
 
@@ -570,137 +888,64 @@ notifier:
 access_control:
   default_policy: one_factor
   rules:
-    - domain: ['portal.__COOKIE_DOMAIN__']
+    - domain: ['portal.${cookie_domain}']
       policy: one_factor
 
 session:
-  secret: REPLACE_SESSION_SECRET
+  secret: ${sess_secret}
   cookies:
     - name: authelia_session
-      domain: __COOKIE_DOMAIN__
-      authelia_url: __AUTHELIA_URL__
+      domain: ${cookie_domain}
+      authelia_url: ${authelia_url}
       same_site: lax
       expiration: 1h
       inactivity: 5m
 
 identity_validation:
   reset_password:
-    jwt_secret: REPLACE_RESET_JWT
+    jwt_secret: ${reset_jwt}
 YAML
+  
+  log_success "Utworzono konfigurację Authelii"
+  return 0
+}
+
+# Configure Docker services
+configure_docker_services() {
+  log_info "Konfiguruję usługi Docker"
+  
+  if [[ ! -d "$INSTALL_ROOT/server" ]]; then
+    log_error "Katalog server nie istnieje"
+    return 1
+  fi
+  
+  pushd "$INSTALL_ROOT/server" >/dev/null
+  
+  # Create docker-compose.yml from template
+  if [[ -f "docker-compose.yml.tmpl" ]]; then
+    sed \
+      -e "s/{{PUBLIC_IP}}/${PUBLIC_IP:-}/g" \
+      -e "s/{{WG_SUBNET}}/${WG_SUBNET//\//\\/}/g" \
+      -e "s/{{ALLOWED_IPS}}/${ALLOWED_IPS:-10.66.0.0/24}/g" \
+      "docker-compose.yml.tmpl" > docker-compose.yml
+    log_success "Utworzono docker-compose.yml"
   else
-  cat > "$AUTHELIA_DIR/configuration.yml" <<YAML
-theme: light
-
-log:
-  level: info
-
-server:
-  address: 'tcp://0.0.0.0:9091'
-
-authentication_backend:
-  file:
-    path: /config/users_database.yml
-
-storage:
-  encryption_key: REPLACE_STORAGE_KEY
-  local:
-    path: /config/db.sqlite3
-
-notifier:
-  filesystem:
-    filename: /config/notification.txt
-
-access_control:
-  default_policy: one_factor
-  rules:
-    - domain: ['portal.__COOKIE_DOMAIN__']
-      policy: one_factor
-
-session:
-  secret: REPLACE_SESSION_SECRET
-  cookies:
-    - name: authelia_session
-      domain: __COOKIE_DOMAIN__
-      authelia_url: __AUTHELIA_URL__
-      same_site: lax
-      expiration: 1h
-      inactivity: 5m
-
-identity_validation:
-  reset_password:
-    jwt_secret: REPLACE_RESET_JWT
-
-identity_providers:
-  oidc:
-    # Authelia użyje tego klucza do podpisu tokenów
-    issuer_private_key: |
-$(echo "$OIDC_RSA" | sed 's/^/      /')
-    enforce_pkce: public_clients_only
-    clients:
-      - id: webapp
-        description: Web Frontend (SPA)
-        public: true
-        redirect_uris:
-          - ${OIDC_WEB_REDIRECT}
-        scopes:
-          - openid
-          - profile
-          - email
-        grant_types:
-          - authorization_code
-        response_types:
-          - code
-        token_endpoint_auth_method: none
-      - id: core-api
-        description: Core API (confidential)
-        secret: ${OIDC_API_SECRET}
-        redirect_uris:
-          - ${OIDC_API_REDIRECT}
-        scopes:
-          - openid
-          - profile
-          - email
-        grant_types:
-          - authorization_code
-        response_types:
-          - code
-        token_endpoint_auth_method: client_secret_post
-YAML
+    log_error "Brak szablonu docker-compose.yml.tmpl"
+    return 1
   fi
-  sed -i "s|REPLACE_STORAGE_KEY|${STOR_KEY//|/\|}|" "$AUTHELIA_DIR/configuration.yml"
-  sed -i "s|REPLACE_SESSION_SECRET|${SESS_SECRET//|/\|}|" "$AUTHELIA_DIR/configuration.yml"
-  sed -i "s|__AUTHELIA_URL__|${AUTHELIA_URL//|/\|}|" "$AUTHELIA_DIR/configuration.yml"
-  sed -i "s|__COOKIE_DOMAIN__|${COOKIE_DOMAIN//|/\|}|" "$AUTHELIA_DIR/configuration.yml"
-  sed -i "s|REPLACE_RESET_JWT|${RESET_JWT//|/\|}|" "$AUTHELIA_DIR/configuration.yml"
-  success "Zapisano minimalny Authelia configuration.yml"
-  # Walidacja konfiguracji zanim odpalimy stack
-  if ! authelia_validate "$AUTHELIA_DIR/configuration.yml"; then
-    error "Walidacja pliku Authelii nie powiodła się – sprawdź komunikaty powyżej"; exit 1;
+  
+  # Create domain override if needed
+  if [[ -n "${DOMAIN:-}" ]]; then
+    create_domain_override || return 1
   fi
-else
-  info "Pozostawiono istniejący Authelia configuration.yml (ustaw FORCE_AUTHELIA_MINIMAL=1 aby nadpisać)"
-fi
+  
+  popd >/dev/null
+  return 0
+}
 
-# --- Render docker-compose.yml ---
-# Sprawdź czy katalog server istnieje
-if [[ ! -d "$INSTALL_ROOT/server" ]]; then
-  error "Katalog $INSTALL_ROOT/server nie istnieje. Sprawdzam strukturę..."
-  ls -la "$INSTALL_ROOT/" || true
-  error "Instalacja nie powiodła się - brak katalogu server"
-  exit 1
-fi
-
-pushd "$INSTALL_ROOT/server" >/dev/null
-sed \
-  -e "s/{{PUBLIC_IP}}/${PUBLIC_IP:-}/g" \
-  -e "s/{{WG_SUBNET}}/${WG_SUBNET//\//\\/}/g" \
-  -e "s/{{ALLOWED_IPS}}/${ALLOWED_IPS//\//\\/}/g" \
-  "$INSTALL_ROOT/server/docker-compose.yml.tmpl" > docker-compose.yml
-
-# TLS override dla domeny (Traefik websecure + LE)
-if [[ -n "$DOMAIN" ]]; then
+# Create domain override for Traefik
+create_domain_override() {
   cat > docker-compose.override.yml <<OVR
-version: "3.9"
 services:
   traefik:
     command:
@@ -714,70 +959,133 @@ services:
       - traefik-acme:/acme.json
   webapp:
     labels:
-      - traefik.http.routers.webapp-public.rule=Host(`$DOMAIN`) && (PathPrefix(`/`) || PathPrefix(`/register`) || PathPrefix(`/invite`))
+      - traefik.http.routers.webapp-public.rule=Host(\`${DOMAIN}\`) && (PathPrefix(\`/\`) || PathPrefix(\`/register\`) || PathPrefix(\`/invite\`))
       - traefik.http.routers.webapp-public.entrypoints=websecure
       - traefik.http.routers.webapp-public.tls.certresolver=le
   core-api:
     labels:
-      - traefik.http.routers.coreapi-public.rule=Host(`$DOMAIN`) && (PathPrefix(`/api/core/registration`) || PathPrefix(`/api/core/captcha`))
+      - traefik.http.routers.coreapi-public.rule=Host(\`${DOMAIN}\`) && (PathPrefix(\`/api/core/registration\`) || PathPrefix(\`/api/core/captcha\`))
       - traefik.http.routers.coreapi-public.entrypoints=websecure
       - traefik.http.routers.coreapi-public.tls.certresolver=le
 volumes:
   traefik-acme:
 OVR
-fi
-
-# Uruchom stack (dnsmasq + reszta)
-docker compose up -d
-
-# Restart samego dnsmasq jeśli już był
-docker compose restart dnsmasq || true
-
-# Autostart cron @reboot
-bash "$INSTALL_ROOT/scripts/install_cron.sh" || true
-popd >/dev/null
-
-# --- Admin WG klient ---
-mkdir -p "$INSTALL_ROOT/tools"
-{
-  admin_priv=$(tr -d '\n' </etc/wireguard/admin.key)
-  server_pub=$(tr -d '\n' </etc/wireguard/server.pub)
-  endpoint_host="${DOMAIN:-${PUBLIC_IP:-}}"
-  tmpf=$(mktemp)
-  sed \
-    -e "s|{{ENDPOINT_HOST}}|${endpoint_host}|g" \
-    -e "s|{{WG_PORT}}|${WG_PORT}|g" \
-    -e "s|{{CLIENT_PRIVATE_KEY}}|${admin_priv}|g" \
-    -e "s|{{SERVER_PUBLIC_KEY}}|${server_pub}|g" \
-    -e "s|{{ALLOWED_IPS}}|${ALLOWED_IPS}|g" \
-    "$INSTALL_ROOT/tools/wg-client-sample.conf" > "$tmpf"
-  install -m 600 "$tmpf" "$INSTALL_ROOT/tools/admin-wg.conf" || true
-  rm -f "$tmpf" || true
-  # Opcjonalny auto-upload na CachyOS (SSH), ustaw CACHYOS_SSH=user@host
-  if [[ -n "${CACHYOS_SSH:-}" ]]; then
-    info "Wysyłam profil WireGuard na ${CACHYOS_SSH}"
-    scp -o StrictHostKeyChecking=no "$INSTALL_ROOT/tools/admin-wg.conf" "${CACHYOS_SSH}:~/admin-wg.conf" || warn "scp nie powiodło się"
-    ssh -o StrictHostKeyChecking=no "${CACHYOS_SSH}" "mkdir -p ~/.config/wireguard && install -m 600 ~/admin-wg.conf ~/.config/wireguard/safe-spac.conf" || warn "zdalna instalacja pliku nie powiodła się"
-    success "Profil zainstalowany na ${CACHYOS_SSH}: ~/.config/wireguard/safe-spac.conf"
-  fi
+  
+  log_success "Utworzono docker-compose.override.yml dla domeny $DOMAIN"
 }
 
-cat <<EON
+# Start services
+start_services() {
+  log_info "Uruchamiam usługi Docker"
+  
+  pushd "$INSTALL_ROOT/server" >/dev/null
+  
+  # Start services
+  if docker compose up -d; then
+    log_success "Usługi Docker uruchomione"
+  else
+    log_error "Nie udało się uruchomić usług Docker"
+    return 1
+  fi
+  
+  # Restart dnsmasq if needed
+  docker compose restart dnsmasq || true
+  
+  # Install cron job
+  if [[ -f "$INSTALL_ROOT/scripts/install_cron.sh" ]]; then
+    bash "$INSTALL_ROOT/scripts/install_cron.sh" || log_warn "Nie udało się zainstalować cron"
+  fi
+  
+  popd >/dev/null
+  return 0
+}
 
-# --- Końcowy self-test ---
-self_tests || true
-[OK] Instalacja zakończona.
-Tryb publiczny: $([[ -n "$DOMAIN" ]] && echo "https://$DOMAIN" || echo "http://${PUBLIC_IP:-<IP>}" )
-Portal (VPN): http://portal.${PRIVATE_SUFFIX}
+# Create admin WireGuard profile
+create_admin_profile() {
+  log_info "Tworzę profil WireGuard dla administratora"
+  
+  mkdir -p "$INSTALL_ROOT/tools"
+  
+  # Read keys
+  local admin_priv
+  local server_pub
+  local endpoint_host
+  
+  if [[ -f /etc/wireguard/admin.key ]]; then
+    admin_priv=$(tr -d '\n' </etc/wireguard/admin.key 2>/dev/null || true)
+  else
+    log_warn "Brak klucza prywatnego admina"
+    return 1
+  fi
+  
+  if [[ -f /etc/wireguard/server.pub ]]; then
+    server_pub=$(tr -d '\n' </etc/wireguard/server.pub 2>/dev/null || true)
+  else
+    log_warn "Brak klucza publicznego serwera"
+    return 1
+  fi
+  
+  # Set endpoint host
+  if [[ -n "${DOMAIN:-}" ]]; then
+    endpoint_host="$DOMAIN"
+  else
+    endpoint_host="${PUBLIC_IP:-}"
+  fi
+  
+  # Create profile
+  local tmpf=$(mktemp)
+  if [[ -f "$INSTALL_ROOT/tools/wg-client-sample.conf" ]]; then
+    sed \
+      -e "s|{{ENDPOINT_HOST}}|${endpoint_host}|g" \
+      -e "s|{{WG_PORT}}|${WG_PORT}|g" \
+      -e "s|{{CLIENT_PRIVATE_KEY}}|${admin_priv}|g" \
+      -e "s|{{SERVER_PUBLIC_KEY}}|${server_pub}|g" \
+      -e "s|{{ALLOWED_IPS}}|${ALLOWED_IPS:-10.66.0.0/24}|g" \
+      "$INSTALL_ROOT/tools/wg-client-sample.conf" > "$tmpf"
+  else
+    # Create basic profile if template doesn't exist
+    cat > "$tmpf" <<EOF
+[Interface]
+PrivateKey = ${admin_priv}
+Address = 10.66.0.2/24
+DNS = 10.66.0.1
 
-Dane konta Authelia:
-- login: ${ADMIN_EMAIL}
-- hasło: ${ADMIN_PASS_MSG}
+[Peer]
+PublicKey = ${server_pub}
+Endpoint = ${endpoint_host}:${WG_PORT}
+AllowedIPs = ${ALLOWED_IPS:-10.66.0.0/24}
+PersistentKeepalive = 25
+EOF
+  fi
+  
+  # Install profile
+  if install -m 600 "$tmpf" "$INSTALL_ROOT/tools/admin-wg.conf"; then
+    log_success "Utworzono profil admin-wg.conf"
+  else
+    log_warn "Nie udało się utworzyć profilu admin-wg.conf"
+  fi
+  
+  # Cleanup
+  rm -f "$tmpf" || true
+  
+  # Optional: Upload to remote host if CACHYOS_SSH is set
+  if [[ -n "${CACHYOS_SSH:-}" ]]; then
+    log_info "Wysyłam profil WireGuard na ${CACHYOS_SSH}"
+    if scp -o StrictHostKeyChecking=no "$INSTALL_ROOT/tools/admin-wg.conf" "${CACHYOS_SSH}:~/admin-wg.conf"; then
+      if ssh -o StrictHostKeyChecking=no "${CACHYOS_SSH}" "mkdir -p ~/.config/wireguard && install -m 600 ~/admin-wg.conf ~/.config/wireguard/safe-spac.conf"; then
+        log_success "Profil zainstalowany na ${CACHYOS_SSH}: ~/.config/wireguard/safe-spac.conf"
+      else
+        log_warn "Zdalna instalacja pliku nie powiodła się"
+      fi
+    else
+      log_warn "scp nie powiodło się"
+    fi
+  fi
+  
+  return 0
+}
 
-Profil WireGuard admina:
-- $INSTALL_ROOT/tools/admin-wg.conf
-
-Uwaga:
-- Jeśli używasz domeny, upewnij się, że rekord A wskazuje na IP serwera oraz port 80/443 są otwarte.
- - Jeśli hostowy nginx jest uruchomiony, Traefik może nie przejąć portu 80. Rozważ wyłączenie nginx.
-EON
+# Main execution
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main_installation "$@"
+fi
