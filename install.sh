@@ -177,7 +177,21 @@ WG_ADDR=${WG_ADDR:-10.66.0.1/24}
 WG_PORT=${WG_PORT:-51820}
 PRIVATE_SUFFIX=${PRIVATE_SUFFIX:-safe.lan}
 FULL_TUNNEL=${FULL_TUNNEL:-}
-INSTALL_ROOT=${INSTALL_ROOT:-/opt/safe-spac}
+
+# Upewnij się, że INSTALL_ROOT jest ustawione poprawnie
+if [[ "${INSTALL_ROOT:-}" != "/opt/safe-spac" ]]; then
+  warn "INSTALL_ROOT nie jest ustawione na /opt/safe-spac, ustawiam poprawnie"
+  INSTALL_ROOT="/opt/safe-spac"
+  export INSTALL_ROOT
+fi
+
+# Debug: sprawdź INSTALL_ROOT
+if [[ "${DEBUG_INSTALL:-}" == "1" ]]; then
+  echo "DEBUG: INSTALL_ROOT po korekcie='$INSTALL_ROOT'" >&2
+  echo "DEBUG: PWD='$(pwd)'" >&2
+  echo "DEBUG: EUID='$EUID'" >&2
+fi
+
 DATA_DIR="$INSTALL_ROOT/server/data"
 AUTHELIA_DIR="$INSTALL_ROOT/authelia"
 DNSMASQ_DIR="$INSTALL_ROOT/dnsmasq"
@@ -229,7 +243,22 @@ if ! command -v wg >/dev/null 2>&1; then
 fi
 
 # --- Skopiowanie repo do /opt ---
-mkdir -p "$INSTALL_ROOT"
+# Upewnij się, że jesteśmy w odpowiednim kontekście
+if [[ "$EUID" -eq 0 ]]; then
+  # Jesteśmy root - możemy tworzyć katalogi w /opt
+  mkdir -p "$INSTALL_ROOT"
+  chown root:root "$INSTALL_ROOT" 2>/dev/null || true
+else
+  error "Skrypt musi być uruchomiony jako root (sudo)"
+  exit 1
+fi
+
+# Debug: sprawdź czy katalog został utworzony
+if [[ "${DEBUG_INSTALL:-}" == "1" ]]; then
+  echo "DEBUG: Sprawdzam czy INSTALL_ROOT został utworzony:" >&2
+  ls -ld "$INSTALL_ROOT" || echo "DEBUG: Nie można wyświetlić INSTALL_ROOT" >&2
+  echo "DEBUG: Aktualny katalog: $(pwd)" >&2
+fi
 
 # Debug: sprawdź ścieżki (tylko w przypadku problemów)
 if [[ "${DEBUG_INSTALL:-}" == "1" ]]; then
@@ -238,20 +267,61 @@ if [[ "${DEBUG_INSTALL:-}" == "1" ]]; then
   ls -la "$SCRIPT_DIR" || echo "DEBUG: Nie można wyświetlić SCRIPT_DIR" >&2
 fi
 
-# Sprawdź czy rsync jest dostępny
-if ! command -v rsync >/dev/null 2>&1; then
-  error "rsync nie jest dostępny - używam cp jako fallback"
-  cp -r "$SCRIPT_DIR"/* "$INSTALL_ROOT/" 2>/dev/null || {
-    error "Nie można skopiować plików z $SCRIPT_DIR do $INSTALL_ROOT"
+# Problem: gdy skrypt jest uruchamiany przez curl | bash, SCRIPT_DIR może być niepoprawne
+# Sprawdź czy SCRIPT_DIR zawiera pliki safe-spac
+if [[ ! -f "$SCRIPT_DIR/install.sh" ]] || [[ ! -d "$SCRIPT_DIR/server" ]]; then
+  warn "SCRIPT_DIR ($SCRIPT_DIR) nie zawiera plików safe-spac - używam fallback"
+  
+  # Fallback: pobierz pliki bezpośrednio z GitHub
+  info "Pobieram pliki safe-spac bezpośrednio z GitHub"
+  cd "$INSTALL_ROOT"
+  
+  # Pobierz główne pliki
+  curl -fsSL https://raw.githubusercontent.com/Co0ob1iee/safe-spac/main/install.sh -o install.sh || {
+    error "Nie można pobrać install.sh z GitHub"
     exit 1
   }
+  
+  # Pobierz katalog server
+  mkdir -p server
+  cd server
+  
+  # Pobierz docker-compose.yml.tmpl
+  curl -fsSL https://raw.githubusercontent.com/Co0ob1iee/safe-spac/main/server/docker-compose.yml.tmpl -o docker-compose.yml.tmpl || {
+    error "Nie można pobrać docker-compose.yml.tmpl"
+    exit 1
+  }
+  
+  # Pobierz inne potrzebne pliki
+  for dir in authelia core-api teamspeak webapp wg-provisioner; do
+    mkdir -p "$dir"
+    # Można dodać pobieranie specyficznych plików dla każdego katalogu
+  done
+  
+  cd ..
+  
+  # Pobierz inne potrzebne katalogi
+  mkdir -p scripts tools dnsmasq
+  curl -fsSL https://raw.githubusercontent.com/Co0ob1iee/safe-spac/main/scripts/install_cron.sh -o scripts/install_cron.sh || true
+  curl -fsSL https://raw.githubusercontent.com/Co0ob1iee/safe-spac/main/tools/wg-client-sample.conf -o tools/wg-client-sample.conf || true
+  
+  success "Pobrano pliki safe-spac z GitHub"
 else
-  rsync -a --delete --exclude .git --exclude build --exclude node_modules "$SCRIPT_DIR"/ "$INSTALL_ROOT/"
+  # Normalne kopiowanie przez rsync
+  if ! command -v rsync >/dev/null 2>&1; then
+    error "rsync nie jest dostępny - używam cp jako fallback"
+    cp -r "$SCRIPT_DIR"/* "$INSTALL_ROOT/" 2>/dev/null || {
+      error "Nie można skopiować plików z $SCRIPT_DIR do $INSTALL_ROOT"
+      exit 1
+    }
+  else
+    rsync -a --delete --exclude .git --exclude build --exclude node_modules "$SCRIPT_DIR"/ "$INSTALL_ROOT/"
+  fi
 fi
 
-# Sprawdź czy katalog server został skopiowany
+# Sprawdź czy katalog server został utworzony
 if [[ ! -d "$INSTALL_ROOT/server" ]]; then
-  error "Katalog server nie został skopiowany. Sprawdzam zawartość INSTALL_ROOT:"
+  error "Katalog server nie został utworzony. Sprawdzam zawartość INSTALL_ROOT:"
   ls -la "$INSTALL_ROOT/" || true
   error "Instalacja nie powiodła się - problem z kopiowaniem plików"
   exit 1
