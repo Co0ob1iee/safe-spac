@@ -1,25 +1,58 @@
-# Build core-api
-FROM golang:1.23-alpine AS build
-WORKDIR /src
-COPY go.mod .
-# Pre-fetch modules and generate go.sum to avoid build failures on missing sums
-RUN go mod download
-COPY cmd ./cmd
-# Ensure VCS tools are available for fetching modules and tidy the module
-RUN apk add --no-cache git \
-    && cd cmd/coreapi \
-    && go mod tidy
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    cd cmd/coreapi && go build -o /out/coreapi
+# Multi-stage build for Go application
+FROM golang:1.24-alpine AS builder
 
-FROM alpine:3.20
-RUN apk add --no-cache curl \
-    && adduser -D app
-USER app
+# Install build dependencies
+RUN apk add --no-cache git ca-certificates tzdata
+
+# Set working directory
 WORKDIR /app
-COPY --from=build /out/coreapi /app/coreapi
+
+# Copy go mod files
+COPY go.mod go.sum ./
+
+# Download dependencies
+RUN go mod download
+
+# Copy source code
+COPY . .
+
+# Build the application
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o coreapi cmd/coreapi/main.go
+
+# Final stage
+FROM alpine:latest
+
+# Install runtime dependencies
+RUN apk --no-cache add ca-certificates tzdata
+
+# Create non-root user
+RUN addgroup -g 1001 -S appgroup && \
+    adduser -u 1001 -S appuser -G appgroup
+
+# Set working directory
+WORKDIR /app
+
+# Copy binary from builder stage
+COPY --from=builder /app/coreapi .
+
+# Create data directory
+RUN mkdir -p /data && chown -R appuser:appgroup /data
+
+# Switch to non-root user
+USER appuser
+
+# Expose port
 EXPOSE 8080
+<<<<<<< Current (Your changes)
 ENTRYPOINT ["/app/coreapi"]
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
   CMD curl -fsS http://localhost:8080/ >/dev/null || exit 1
+=======
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1
+
+# Run the application
+CMD ["./coreapi"]
+>>>>>>> Incoming (Background Agent changes)
